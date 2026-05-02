@@ -1,0 +1,9 @@
+target/
+*.class
+*.jar
+*.log
+*.iml
+.idea/
+.vscode/
+*.DS_Store
+eventstream-logs/
