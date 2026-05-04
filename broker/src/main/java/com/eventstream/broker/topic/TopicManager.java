@@ -12,21 +12,22 @@ import java.util.logging.Logger;
 /**
  * Owns all topics and their partitions.
  *
- * createTopic() is idempotent: creating the same topic twice returns false
- * (already-exists) but leaves the system consistent.
+ * Phase 2 changes:
+ *   - Topics are now represented by Topic (holding a Partition[] array) instead
+ *     of a nested ConcurrentHashMap.  Array indexing is O(1) with no hash
+ *     overhead on the hot produce/fetch path.
+ *   - createTopic() accepts a numPartitions argument.
+ *   - route() delegates to Topic.route() for key-hash or round-robin selection.
  *
- * Thread safety: ConcurrentHashMap.putIfAbsent guarantees that only one
- * thread initialises a given topic, and the partition map is fully populated
- * before it becomes visible to any reader.
+ * Thread safety: ConcurrentHashMap.putIfAbsent guarantees that only one thread
+ * initialises a given topic.  All partitions are fully built before the topic
+ * is made visible, so getPartition() and route() never observe a partial state.
  */
 public final class TopicManager implements Closeable {
 
     private static final Logger log = Logger.getLogger(TopicManager.class.getName());
 
-    // topicName -> (partitionId -> Partition)
-    private final ConcurrentHashMap<String, ConcurrentHashMap<Integer, Partition>> topics =
-            new ConcurrentHashMap<>();
-
+    private final ConcurrentHashMap<String, Topic> topics = new ConcurrentHashMap<>();
     private final Path logRoot;
 
     public TopicManager(Path logRoot) throws IOException {
@@ -36,46 +37,65 @@ public final class TopicManager implements Closeable {
     }
 
     /**
-     * Creates topic with a single partition (partition 0).
+     * Creates a topic with the given number of partitions.
      * @return true if created, false if already existed
      */
-    public boolean createTopic(String name) throws IOException {
-        // Build the partition before making the topic visible so that any
-        // concurrent getPartition() call never observes a topic without p-0.
-        Path segDir = logRoot.resolve(name).resolve("partition-0");
-        Files.createDirectories(segDir);
-        LogSegment segment = new LogSegment(segDir.resolve("00000000.log"));
-        Partition p = new Partition(name, 0, segment);
+    public boolean createTopic(String name, int numPartitions) throws IOException {
+        if (numPartitions < 1) throw new IllegalArgumentException("numPartitions must be >= 1");
 
-        ConcurrentHashMap<Integer, Partition> partitions = new ConcurrentHashMap<>();
-        partitions.put(0, p);
+        // Build all partitions before calling putIfAbsent.
+        // If we lose the race, we close them and return false — disk dirs are idempotent.
+        Partition[] partitions = new Partition[numPartitions];
+        for (int i = 0; i < numPartitions; i++) {
+            Path segDir = logRoot.resolve(name).resolve("partition-" + i);
+            Files.createDirectories(segDir);
+            LogSegment seg = new LogSegment(segDir.resolve("00000000.log"));
+            partitions[i] = new Partition(name, i, seg);
+        }
 
-        ConcurrentHashMap<Integer, Partition> existing = topics.putIfAbsent(name, partitions);
+        Topic topic    = new Topic(name, partitions);
+        Topic existing = topics.putIfAbsent(name, topic);
         if (existing != null) {
-            // Lost the race — discard the partition we just built.
-            p.close();
+            for (Partition p : partitions) {
+                try { p.close(); } catch (IOException ignored) {}
+            }
             return false;
         }
 
-        log.info("Topic created: " + name);
+        log.info("Topic created: " + name + " (partitions=" + numPartitions + ")");
         return true;
     }
 
     /**
-     * Returns the requested partition, or null if the topic / partition does
-     * not exist.
+     * Routes a produce request to a partition using the provided key.
+     * Returns null if the topic does not exist.
+     */
+    public Partition route(String topicName, byte[] key) {
+        Topic topic = topics.get(topicName);
+        if (topic == null) return null;
+        return topic.route(key);
+    }
+
+    /**
+     * Returns a specific partition by id. Returns null if the topic or
+     * partition id does not exist.
      */
     public Partition getPartition(String topicName, int partitionId) {
-        ConcurrentHashMap<Integer, Partition> parts = topics.get(topicName);
-        if (parts == null) return null;
-        return parts.get(partitionId);
+        Topic topic = topics.get(topicName);
+        if (topic == null) return null;
+        return topic.get(partitionId);
+    }
+
+    public int numPartitions(String topicName) {
+        Topic topic = topics.get(topicName);
+        return topic == null ? 0 : topic.numPartitions();
     }
 
     @Override
     public void close() {
-        for (var parts : topics.values()) {
-            for (var partition : parts.values()) {
-                try { partition.close(); } catch (IOException ignored) {}
+        for (Topic topic : topics.values()) {
+            for (Partition p : topic.partitions) {
+                try { p.close(); } catch (IOException ignored) {}
             }
         }
     }

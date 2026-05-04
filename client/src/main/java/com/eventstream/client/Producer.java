@@ -9,13 +9,19 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 
 /**
- * Synchronous producer.  Each send() call blocks until the broker has
- * persisted the message and returned an ACK with the assigned offset.
+ * Synchronous producer — Phase 2.
+ *
+ * Changes from Phase 1:
+ *   - createTopic() now accepts a numPartitions argument.
+ *   - send() accepts an optional routing key; the broker hashes it to select
+ *     the target partition (murmur2(key) % numPartitions).
+ *   - PRODUCE_ACK now includes the partitionId the broker assigned.
  *
  * Usage:
  *   try (Producer p = new Producer("localhost", 9092)) {
- *       p.createTopic("orders");
- *       long offset = p.send("orders", "hello".getBytes());
+ *       p.createTopic("orders", 4);
+ *       SendResult r = p.send("orders", "user-42".getBytes(), payload);
+ *       System.out.println("partition=" + r.partitionId + " offset=" + r.offset);
  *   }
  */
 public final class Producer implements Closeable {
@@ -30,38 +36,47 @@ public final class Producer implements Closeable {
     // Public API
     // -------------------------------------------------------------------------
 
-    /**
-     * Creates a topic on the broker.  Safe to call if the topic already exists
-     * (TOPIC_EXISTS is treated as success so callers can be idempotent).
-     */
-    public void createTopic(String topic) throws IOException {
-        conn.send(buildCreateTopicRequest(topic));
+    public void createTopic(String topic, int numPartitions) throws IOException {
+        conn.send(buildCreateTopicRequest(topic, numPartitions));
         ByteBuffer resp = conn.receive();
-        byte type  = resp.get();
+        /* type  = */ resp.get();
         byte error = resp.get();
         if (error != ErrorCode.NONE && error != ErrorCode.TOPIC_EXISTS) {
-            throw new IOException("createTopic failed, errorCode=0x" + Integer.toHexString(error & 0xFF));
+            throw new IOException("createTopic failed, error=0x" + Integer.toHexString(error & 0xFF));
         }
+    }
+
+    /** Creates a single-partition topic (backward-compatible with Phase 1). */
+    public void createTopic(String topic) throws IOException {
+        createTopic(topic, 1);
     }
 
     /**
-     * Sends a message to the given topic.
-     *
-     * @return the byte offset assigned to this message in the partition log
+     * Sends a message with a routing key.
+     * The broker selects the partition via murmur2(key) % numPartitions.
      */
-    public long send(String topic, byte[] message) throws IOException {
-        conn.send(buildProduceRequest(topic, message));
+    public SendResult send(String topic, byte[] key, byte[] message) throws IOException {
+        conn.send(buildProduceRequest(topic, key, message));
         ByteBuffer resp = conn.receive();
-        byte type  = resp.get();
-        byte error = resp.get();
+        /* type      = */ resp.get();
+        byte error     = resp.get();
         if (error != ErrorCode.NONE) {
-            throw new IOException("send failed, errorCode=0x" + Integer.toHexString(error & 0xFF));
+            throw new IOException("send failed, error=0x" + Integer.toHexString(error & 0xFF));
         }
-        return resp.getLong();
+        int  partitionId = resp.getInt();
+        long offset      = resp.getLong();
+        return new SendResult(partitionId, offset);
     }
 
-    public long send(String topic, String message) throws IOException {
-        return send(topic, message.getBytes(StandardCharsets.UTF_8));
+    /** Sends a keyless message; the broker uses round-robin partition selection. */
+    public SendResult send(String topic, byte[] message) throws IOException {
+        return send(topic, null, message);
+    }
+
+    public SendResult send(String topic, String key, String message) throws IOException {
+        return send(topic,
+                key == null ? null : key.getBytes(StandardCharsets.UTF_8),
+                message.getBytes(StandardCharsets.UTF_8));
     }
 
     @Override
@@ -73,31 +88,40 @@ public final class Producer implements Closeable {
     // Request builders
     // -------------------------------------------------------------------------
 
-    private static ByteBuffer buildCreateTopicRequest(String topic) {
-        byte[] topicBytes = topic.getBytes(StandardCharsets.UTF_8);
-        // body = type(1) + topicLen(2) + topic(N)
-        int bodyLen = 1 + 2 + topicBytes.length;
+    private static ByteBuffer buildCreateTopicRequest(String topic, int numPartitions) {
+        byte[] tb = topic.getBytes(StandardCharsets.UTF_8);
+        int bodyLen = 1 + 2 + tb.length + 4; // type + topicLen + topic + numPartitions
         ByteBuffer buf = ByteBuffer.allocate(4 + bodyLen);
         buf.putInt(bodyLen);
         buf.put(RequestType.CREATE_TOPIC);
-        buf.putShort((short) topicBytes.length);
-        buf.put(topicBytes);
+        buf.putShort((short) tb.length);
+        buf.put(tb);
+        buf.putInt(numPartitions);
         buf.flip();
         return buf;
     }
 
-    private static ByteBuffer buildProduceRequest(String topic, byte[] message) {
-        byte[] topicBytes = topic.getBytes(StandardCharsets.UTF_8);
-        // body = type(1) + topicLen(2) + topic(N) + msgLen(4) + msg(M)
-        int bodyLen = 1 + 2 + topicBytes.length + 4 + message.length;
+    private static ByteBuffer buildProduceRequest(String topic, byte[] key, byte[] message) {
+        byte[] tb = topic.getBytes(StandardCharsets.UTF_8);
+        int keyLen = (key == null || key.length == 0) ? -1 : key.length;
+        // body = type(1) + topicLen(2) + topic + keyLen(4) + key? + payloadLen(4) + payload
+        int bodyLen = 1 + 2 + tb.length + 4 + (keyLen > 0 ? keyLen : 0) + 4 + message.length;
         ByteBuffer buf = ByteBuffer.allocate(4 + bodyLen);
         buf.putInt(bodyLen);
         buf.put(RequestType.PRODUCE);
-        buf.putShort((short) topicBytes.length);
-        buf.put(topicBytes);
+        buf.putShort((short) tb.length);
+        buf.put(tb);
+        buf.putInt(keyLen);
+        if (keyLen > 0) buf.put(key);
         buf.putInt(message.length);
         buf.put(message);
         buf.flip();
         return buf;
     }
+
+    // -------------------------------------------------------------------------
+    // Result type
+    // -------------------------------------------------------------------------
+
+    public record SendResult(int partitionId, long offset) {}
 }

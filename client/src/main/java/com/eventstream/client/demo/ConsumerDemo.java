@@ -3,48 +3,68 @@ package com.eventstream.client.demo;
 import com.eventstream.client.Consumer;
 import com.eventstream.client.FetchResult;
 
+import java.util.List;
+
 /**
- * Standalone demo: connects to the broker and reads all messages from offset 0,
- * polling until no new messages arrive for 3 consecutive rounds.
+ * Phase 2 consumer demo.
+ *
+ * Reads from all 4 partitions of "demo-topic" in a round-robin polling loop,
+ * maintaining a per-partition offset array.  Exits after 3 consecutive empty
+ * polls across all partitions.
+ *
+ * This demonstrates the fundamental multi-partition consumption pattern that
+ * Phase 3 (consumer groups) will automate.
  *
  * Run: java -cp client.jar com.eventstream.client.demo.ConsumerDemo [host] [port]
  */
 public final class ConsumerDemo {
 
-    public static void main(String[] args) throws Exception {
-        String host  = args.length > 0 ? args[0] : "localhost";
-        int    port  = args.length > 1 ? Integer.parseInt(args[1]) : 9092;
-        String topic = "demo-topic";
+    private static final String TOPIC          = "demo-topic";
+    private static final int    NUM_PARTITIONS  = 4;
 
-        System.out.println("Connecting to broker at " + host + ":" + port);
+    public static void main(String[] args) throws Exception {
+        String host = args.length > 0 ? args[0] : "localhost";
+        int    port = args.length > 1 ? Integer.parseInt(args[1]) : 9092;
+
+        System.out.println("Connecting to " + host + ":" + port);
+        System.out.println("Reading from topic '" + TOPIC + "' (" + NUM_PARTITIONS + " partitions)\n");
 
         try (Consumer consumer = new Consumer(host, port)) {
-            long offset     = 0;
-            int  emptyRound = 0;
-            int  total      = 0;
 
-            System.out.println("Reading from topic '" + topic + "' (offset 0) ...");
+            long[] offsets   = new long[NUM_PARTITIONS]; // all start at 0
+            int    total     = 0;
+            int    emptyRound = 0;
 
             while (emptyRound < 3) {
-                FetchResult result = consumer.poll(topic, offset);
+                List<FetchResult> results = consumer.pollAll(TOPIC, NUM_PARTITIONS, offsets);
 
-                if (result.isEmpty()) {
+                boolean anyMessages = false;
+                for (FetchResult result : results) {
+                    if (result.isEmpty()) continue;
+                    anyMessages = true;
+
+                    for (byte[] msg : result.messages) {
+                        total++;
+                        System.out.printf("  [msg %3d]  partition=%d  offset=%-6d  %s%n",
+                                total, result.partitionId, offsets[result.partitionId],
+                                new String(msg));
+                    }
+                    offsets[result.partitionId] = result.nextOffset;
+                }
+
+                if (!anyMessages) {
                     emptyRound++;
                     Thread.sleep(200);
-                    continue;
+                } else {
+                    emptyRound = 0;
                 }
-
-                emptyRound = 0;
-                for (byte[] msg : result.messages) {
-                    total++;
-                    System.out.printf("  [msg %2d @ offset %-6d]  %s%n",
-                            total, offset, new String(msg));
-                    offset = result.nextOffset; // advance after each message is processed
-                }
-                offset = result.nextOffset;
             }
 
-            System.out.println("No more messages. Total read: " + total);
+            System.out.println("\nNo more messages. Total read: " + total);
+            System.out.println("Final offsets per partition:");
+            for (int p = 0; p < NUM_PARTITIONS; p++) {
+                System.out.printf("  partition-%d: %d bytes consumed%n", p, offsets[p]);
+            }
         }
     }
 }

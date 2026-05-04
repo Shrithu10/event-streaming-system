@@ -3,100 +3,81 @@ package com.eventstream.broker.network;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
-import java.util.ArrayDeque;
-import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
  * Per-connection state attached to a SelectionKey.
  *
- * Read side – frame reassembly:
- *   The NIO layer gives us raw bytes; TCP is a stream, not message-oriented.
- *   readBuf accumulates bytes in write-mode.  pollFrame() flips, extracts one
- *   complete [4-byte-length + body] frame if available, then compacts the
- *   buffer back to write-mode for the next channel.read().
+ * Read side (selector thread only):
+ *   readBuf accumulates raw bytes in write-mode. pollFrame() flips, extracts
+ *   one complete length-prefixed frame, then compacts back to write-mode.
+ *   This is unchanged from Phase 1.
  *
- * Write side – response queue:
- *   Handlers produce fully-framed response ByteBuffers.  They are queued here
- *   and flushed when the channel is writable.  Each buffer must be in read-mode
- *   (flipped) when enqueued.
+ * Write side (MPSC: multiple worker writers, one selector reader):
+ *   Phase 2 changes writeQueue from ArrayDeque to ConcurrentLinkedQueue so
+ *   that worker threads can safely enqueue responses while the selector thread
+ *   drains them. ConcurrentLinkedQueue is lock-free for the MPSC pattern:
+ *   offer() never blocks writers; poll() is called only by the selector.
  */
 public final class Connection {
 
-    private static final int MAX_FRAME_BYTES = 64 * 1024 * 1024; // 64 MB hard cap
+    private static final int MAX_FRAME_BYTES = 64 * 1024 * 1024;
 
     public final SocketChannel channel;
 
-    // write-mode invariant: position = amount of data accumulated, limit = capacity
     private ByteBuffer readBuf = ByteBuffer.allocate(64 * 1024);
 
-    // pending responses, each in read-mode
-    private final Queue<ByteBuffer> writeQueue = new ArrayDeque<>();
+    // Phase 2: ConcurrentLinkedQueue replaces ArrayDeque for MPSC safety.
+    private final ConcurrentLinkedQueue<ByteBuffer> writeQueue = new ConcurrentLinkedQueue<>();
 
     public Connection(SocketChannel channel) {
         this.channel = channel;
     }
 
-    /**
-     * Returns the accumulation buffer so the caller can issue channel.read(buf).
-     * The buffer is always in write-mode when returned.
-     */
     public ByteBuffer readBuffer() {
         return readBuf;
     }
 
-    /**
-     * Attempts to extract one complete frame from the accumulation buffer.
-     *
-     * Invariant maintained: readBuf is always in write-mode after this call.
-     *
-     * @return the frame body (type byte + payload) in read-mode, or null if
-     *         not enough bytes have arrived yet.
-     */
     public ByteBuffer pollFrame() throws IOException {
-        readBuf.flip(); // switch to read-mode
+        readBuf.flip();
 
         if (readBuf.remaining() < 4) {
-            readBuf.compact(); // back to write-mode
+            readBuf.compact();
             return null;
         }
 
-        // Peek at the 4-byte length WITHOUT advancing the position.
         int bodyLen = readBuf.getInt(readBuf.position());
 
         if (bodyLen < 0 || bodyLen > MAX_FRAME_BYTES) {
             readBuf.compact();
-            throw new IOException("Protocol violation: invalid frame body length " + bodyLen);
+            throw new IOException("Protocol violation: bodyLen=" + bodyLen);
         }
 
         if (readBuf.remaining() < 4 + bodyLen) {
-            // Grow the buffer if this frame will not fit.
             if (readBuf.capacity() < 4 + bodyLen) {
                 ByteBuffer bigger = ByteBuffer.allocate(4 + bodyLen + 1024);
-                bigger.put(readBuf); // copies the unread bytes into the new buffer
-                readBuf = bigger;    // readBuf is now in write-mode with data at [0..copied)
-                // Note: after put(), bigger.position() = amount copied, limit = capacity ✓
+                bigger.put(readBuf);
+                readBuf = bigger;
             } else {
                 readBuf.compact();
             }
             return null;
         }
 
-        // Consume the 4-byte length field.
         readBuf.getInt();
-
-        // Extract the frame body into a fresh buffer.
         byte[] body = new byte[bodyLen];
         readBuf.get(body);
-        readBuf.compact(); // compact remaining bytes back to write-mode
-
-        return ByteBuffer.wrap(body); // already in read-mode (wrap() starts at pos=0)
+        readBuf.compact();
+        return ByteBuffer.wrap(body);
     }
 
+    /** Called by worker threads — thread-safe via ConcurrentLinkedQueue. */
     public void enqueueResponse(ByteBuffer response) {
-        writeQueue.add(response);
+        writeQueue.offer(response);
     }
 
-    public Queue<ByteBuffer> writeQueue() {
+    /** Called by the selector thread only. */
+    public ConcurrentLinkedQueue<ByteBuffer> writeQueue() {
         return writeQueue;
     }
 }

@@ -9,31 +9,41 @@ import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.*;
 import java.nio.channels.spi.SelectorProvider;
+import java.util.HashSet;
 import java.util.Iterator;
-import java.util.Queue;
+import java.util.Set;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
 
 /**
- * Single-threaded NIO event loop.
+ * NIO event loop — Phase 2.
  *
- * Architecture decisions:
+ * Phase 1 recap: selector thread did everything (accept, read, dispatch, disk I/O, write).
  *
- *  1. One Selector thread handles accept / read / write.  No lock contention
- *     on the hot path; the only blocking operation is the disk write inside
- *     LogSegment, which completes in microseconds (kernel page cache).
+ * Phase 2 split:
+ *   Selector thread — accept, read (frame assembly), write (drain write queue).
+ *                     No blocking operations. No business logic.
  *
- *  2. Per-connection Connection objects are stored as SelectionKey attachments.
- *     This avoids any Map lookup on every I/O event.
+ *   Worker threads  — decode request, call handler (disk I/O), build response.
+ *                     Enqueue response and post a PendingChange, then wakeup selector.
  *
- *  3. OP_WRITE interest is enabled only when there is data in the write queue,
- *     and disabled immediately after the queue drains.  This avoids busy-spinning
- *     on writable channels that have nothing to send.
+ * Crossing the boundary safely:
  *
- *  4. TCP_NODELAY is set on accepted sockets.  Our protocol is already
- *     length-prefixed, so Nagle's algorithm only adds latency.
+ *   Selector → Workers: ArrayBlockingQueue<RequestContext>
+ *     offer() is non-blocking — if full, OP_READ is suspended for that connection
+ *     (TCP flow control propagates back-pressure to the sender for free).
  *
- * Phase 2 will offload request processing to a worker thread pool and use a
- * wake-up queue to feed responses back to the selector thread.
+ *   Workers → Selector: ConcurrentLinkedQueue<PendingChange> + selector.wakeup()
+ *     Workers enqueue a PendingChange(key, OP_WRITE) and wakeup the selector.
+ *     The selector drains this queue at the top of every loop iteration and
+ *     applies interest-op changes safely in its own thread.
+ *
+ *   Workers → Connection.writeQueue: ConcurrentLinkedQueue<ByteBuffer>
+ *     Workers call connection.enqueueResponse() (lock-free offer).
+ *     The selector calls channel.write() when OP_WRITE fires.
+ *
+ * SelectionKey.interestOps() is NEVER called from worker threads.
  */
 public final class BrokerServer {
 
@@ -42,33 +52,86 @@ public final class BrokerServer {
     private final BrokerConfig      config;
     private final RequestDispatcher dispatcher;
 
-    private Selector          selector;
+    // Selector thread owns these — no external access needed.
+    private Selector           selector;
     private ServerSocketChannel serverChannel;
-    private volatile boolean  running;
+    private volatile boolean    running;
+
+    // ---- Cross-thread structures ----
+
+    // Selector → Workers
+    private final ArrayBlockingQueue<RequestContext> requestQueue;
+
+    // Workers → Selector (interest-op mutations)
+    private final ConcurrentLinkedQueue<PendingChange> pendingChanges = new ConcurrentLinkedQueue<>();
+
+    // Connections paused due to back-pressure (OP_READ suspended).
+    // Accessed only by the selector thread.
+    private final Set<SelectionKey> pausedConnections = new HashSet<>();
+
+    private ExecutorService workerPool;
 
     public BrokerServer(BrokerConfig config, TopicManager topicManager) {
-        this.config     = config;
-        this.dispatcher = new RequestDispatcher(topicManager);
+        this.config       = config;
+        this.dispatcher   = new RequestDispatcher(topicManager);
+        this.requestQueue = new ArrayBlockingQueue<>(config.requestQueueCapacity);
     }
+
+    // -------------------------------------------------------------------------
+    // Lifecycle
+    // -------------------------------------------------------------------------
 
     public void start() throws IOException {
         selector      = SelectorProvider.provider().openSelector();
         serverChannel = ServerSocketChannel.open();
         serverChannel.configureBlocking(false);
-        serverChannel.bind(new InetSocketAddress(config.port), /* backlog */ 128);
+        serverChannel.bind(new InetSocketAddress(config.port), 128);
         serverChannel.register(selector, SelectionKey.OP_ACCEPT);
+
+        startWorkers();
 
         running = true;
         Thread loop = new Thread(this::eventLoop, "broker-event-loop");
         loop.setDaemon(false);
         loop.start();
 
-        log.info("Broker listening on port " + config.port);
+        log.info("Broker started — port=" + config.port
+                + " workers=" + config.workerThreads
+                + " queueCap=" + config.requestQueueCapacity);
     }
 
     public void stop() {
         running = false;
-        selector.wakeup(); // unblocks selector.select()
+        selector.wakeup();
+    }
+
+    // -------------------------------------------------------------------------
+    // Worker pool
+    // -------------------------------------------------------------------------
+
+    private void startWorkers() {
+        AtomicInteger idx = new AtomicInteger();
+        ThreadFactory tf = r -> {
+            Thread t = new Thread(r, "broker-worker-" + idx.getAndIncrement());
+            t.setDaemon(false);
+            return t;
+        };
+        workerPool = Executors.newFixedThreadPool(config.workerThreads, tf);
+        for (int i = 0; i < config.workerThreads; i++) {
+            workerPool.submit(new RequestWorker(requestQueue, pendingChanges, selector, dispatcher));
+        }
+        log.info("Started " + config.workerThreads + " worker threads");
+    }
+
+    private void shutdownWorkers() {
+        workerPool.shutdownNow(); // interrupt blocking take() calls
+        try {
+            if (!workerPool.awaitTermination(5, TimeUnit.SECONDS)) {
+                log.warning("Worker pool did not terminate in 5 s");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -78,15 +141,20 @@ public final class BrokerServer {
     private void eventLoop() {
         while (running) {
             try {
-                selector.select(); // block until at least one key is ready
+                applyPendingChanges();   // must precede select() — applies OP_WRITE registrations
+                resumePausedConnections();
+
+                selector.select();       // blocks until a key is ready or wakeup() is called
+
+                if (!running) break;
+
                 Iterator<SelectionKey> iter = selector.selectedKeys().iterator();
                 while (iter.hasNext()) {
                     SelectionKey key = iter.next();
                     iter.remove();
                     if (!key.isValid()) continue;
-
                     try {
-                        if (key.isAcceptable()) handleAccept();
+                        if (key.isAcceptable())              handleAccept();
                         if (key.isValid() && key.isReadable())  handleRead(key);
                         if (key.isValid() && key.isWritable()) handleWrite(key);
                     } catch (IOException e) {
@@ -95,14 +163,43 @@ public final class BrokerServer {
                     }
                 }
             } catch (ClosedSelectorException e) {
-                break; // normal shutdown
+                break;
             } catch (IOException e) {
                 log.severe("Selector error: " + e.getMessage());
             }
         }
 
+        shutdownWorkers();
         closeAll();
         log.info("Event loop terminated");
+    }
+
+    // -------------------------------------------------------------------------
+    // Pending interest-op changes (workers → selector)
+    // -------------------------------------------------------------------------
+
+    private void applyPendingChanges() {
+        PendingChange change;
+        while ((change = pendingChanges.poll()) != null) {
+            SelectionKey k = change.key();
+            if (k.isValid()) {
+                k.interestOps(k.interestOps() | change.addOps());
+            }
+        }
+    }
+
+    // Resume connections that were paused for back-pressure once the queue
+    // drains below 80% capacity.
+    private void resumePausedConnections() {
+        if (pausedConnections.isEmpty()) return;
+        if (requestQueue.size() > config.requestQueueCapacity * 4 / 5) return;
+
+        for (SelectionKey key : pausedConnections) {
+            if (key.isValid()) {
+                key.interestOps(key.interestOps() | SelectionKey.OP_READ);
+            }
+        }
+        pausedConnections.clear();
     }
 
     // -------------------------------------------------------------------------
@@ -111,7 +208,7 @@ public final class BrokerServer {
 
     private void handleAccept() throws IOException {
         SocketChannel client = serverChannel.accept();
-        if (client == null) return; // spurious wake-up
+        if (client == null) return;
 
         client.configureBlocking(false);
         client.setOption(java.net.StandardSocketOptions.TCP_NODELAY, true);
@@ -122,52 +219,44 @@ public final class BrokerServer {
     }
 
     // -------------------------------------------------------------------------
-    // Read
+    // Read — frame assembly only; no dispatch
     // -------------------------------------------------------------------------
 
     private void handleRead(SelectionKey key) throws IOException {
         Connection conn = (Connection) key.attachment();
 
         int bytesRead = conn.channel.read(conn.readBuffer());
-        if (bytesRead == -1) {
-            // Client closed the connection gracefully.
-            closeKey(key);
-            return;
-        }
+        if (bytesRead == -1) { closeKey(key); return; }
 
-        // There may be multiple complete frames in the buffer — drain them all.
         ByteBuffer frame;
         while ((frame = conn.pollFrame()) != null) {
-            ByteBuffer response = dispatcher.dispatch(frame);
-            conn.enqueueResponse(response);
-        }
-
-        // Register write interest if we have responses to send.
-        if (!conn.writeQueue().isEmpty()) {
-            key.interestOps(key.interestOps() | SelectionKey.OP_WRITE);
+            RequestContext ctx = new RequestContext(key, conn, frame);
+            if (!requestQueue.offer(ctx)) {
+                // Queue full: suspend reads — TCP flow control does the rest.
+                key.interestOps(key.interestOps() & ~SelectionKey.OP_READ);
+                pausedConnections.add(key);
+                log.fine("Back-pressure applied to " + conn.channel);
+                break;
+            }
         }
     }
 
     // -------------------------------------------------------------------------
-    // Write
+    // Write — drain the connection's write queue
     // -------------------------------------------------------------------------
 
     private void handleWrite(SelectionKey key) throws IOException {
         Connection conn = (Connection) key.attachment();
-        Queue<ByteBuffer> queue = conn.writeQueue();
+        var queue = conn.writeQueue();
 
-        while (!queue.isEmpty()) {
-            ByteBuffer buf = queue.peek();
+        ByteBuffer buf;
+        while ((buf = queue.peek()) != null) {
             conn.channel.write(buf);
-            if (buf.hasRemaining()) {
-                // Socket send buffer full; come back when the channel is writable again.
-                break;
-            }
-            queue.poll(); // fully sent — remove from queue
+            if (buf.hasRemaining()) break; // socket send buffer full; retry next cycle
+            queue.poll();
         }
 
         if (queue.isEmpty()) {
-            // No more data to write; stop polling for writability.
             key.interestOps(key.interestOps() & ~SelectionKey.OP_WRITE);
         }
     }
@@ -179,13 +268,12 @@ public final class BrokerServer {
     private void closeKey(SelectionKey key) {
         key.cancel();
         try { key.channel().close(); } catch (IOException ignored) {}
+        pausedConnections.remove(key);
     }
 
     private void closeAll() {
-        for (SelectionKey key : selector.keys()) {
-            closeKey(key);
-        }
-        try { selector.close(); } catch (IOException ignored) {}
+        for (SelectionKey key : selector.keys()) closeKey(key);
+        try { selector.close(); }      catch (IOException ignored) {}
         try { serverChannel.close(); } catch (IOException ignored) {}
     }
 }

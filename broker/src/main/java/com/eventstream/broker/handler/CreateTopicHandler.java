@@ -20,8 +20,11 @@ public final class CreateTopicHandler {
     }
 
     /**
-     * Frame payload (after the request-type byte):
-     *   [2 bytes: topic name length][N bytes: topic name (UTF-8)]
+     * Phase 2 frame payload (after type byte):
+     *   [2B topicLen][N topic][4B numPartitions]
+     *
+     * numPartitions defaults to 1 if the field is absent (backward compat
+     * with Phase 1 clients that do not send it).
      */
     public ByteBuffer handle(ByteBuffer frame) {
         String topicName = readString(frame);
@@ -29,10 +32,14 @@ public final class CreateTopicHandler {
             return ResponseEncoder.createTopicAck(ErrorCode.INTERNAL_ERROR);
         }
 
+        int numPartitions = frame.remaining() >= 4 ? frame.getInt() : 1;
+        if (numPartitions < 1 || numPartitions > 1024) {
+            return ResponseEncoder.createTopicAck(ErrorCode.INTERNAL_ERROR);
+        }
+
         try {
-            boolean created = topicManager.createTopic(topicName);
-            byte errorCode = created ? ErrorCode.NONE : ErrorCode.TOPIC_EXISTS;
-            return ResponseEncoder.createTopicAck(errorCode);
+            boolean created = topicManager.createTopic(topicName, numPartitions);
+            return ResponseEncoder.createTopicAck(created ? ErrorCode.NONE : ErrorCode.TOPIC_EXISTS);
         } catch (IOException e) {
             log.severe("Failed to create topic " + topicName + ": " + e.getMessage());
             return ResponseEncoder.createTopicAck(ErrorCode.INTERNAL_ERROR);

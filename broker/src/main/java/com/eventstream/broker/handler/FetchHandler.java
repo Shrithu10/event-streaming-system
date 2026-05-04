@@ -24,9 +24,15 @@ public final class FetchHandler {
     }
 
     /**
-     * Frame payload (after the request-type byte):
-     *   [2 bytes: topic length][N bytes: topic]
-     *   [8 bytes: startOffset][4 bytes: maxBytes]
+     * Phase 2 frame payload (after type byte):
+     *   [2B topicLen][N topic]
+     *   [4B partitionId]      ← NEW: consumer specifies partition explicitly
+     *   [8B startOffset]
+     *   [4B maxBytes]
+     *
+     * Consumers are responsible for tracking which partitions they consume and
+     * their per-partition offsets. Phase 3 (consumer groups) will introduce
+     * automatic offset management.
      */
     public ByteBuffer handle(ByteBuffer frame) {
         String topicName = readString(frame);
@@ -34,17 +40,18 @@ public final class FetchHandler {
             return ResponseEncoder.fetchResponse(ErrorCode.INTERNAL_ERROR, Collections.emptyList());
         }
 
-        if (frame.remaining() < 12) {
+        if (frame.remaining() < 16) { // partitionId(4) + startOffset(8) + maxBytes(4)
             return ResponseEncoder.fetchResponse(ErrorCode.INTERNAL_ERROR, Collections.emptyList());
         }
-        long startOffset = frame.getLong();
-        int  maxBytes    = frame.getInt();
+        int  partitionId  = frame.getInt();
+        long startOffset  = frame.getLong();
+        int  maxBytes     = frame.getInt();
 
         if (startOffset < 0) {
             return ResponseEncoder.fetchResponse(ErrorCode.INVALID_OFFSET, Collections.emptyList());
         }
 
-        Partition partition = topicManager.getPartition(topicName, 0);
+        Partition partition = topicManager.getPartition(topicName, partitionId);
         if (partition == null) {
             return ResponseEncoder.fetchResponse(ErrorCode.TOPIC_NOT_FOUND, Collections.emptyList());
         }
@@ -53,7 +60,8 @@ public final class FetchHandler {
             List<LogEntry> entries = partition.fetch(startOffset, maxBytes);
             return ResponseEncoder.fetchResponse(ErrorCode.NONE, entries);
         } catch (IOException e) {
-            log.severe("Fetch failed for topic " + topicName + ": " + e.getMessage());
+            log.severe("Fetch failed for topic=" + topicName + " partition=" + partitionId
+                    + ": " + e.getMessage());
             return ResponseEncoder.fetchResponse(ErrorCode.INTERNAL_ERROR, Collections.emptyList());
         }
     }

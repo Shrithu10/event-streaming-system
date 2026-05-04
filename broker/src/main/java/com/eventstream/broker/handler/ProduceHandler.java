@@ -21,37 +21,59 @@ public final class ProduceHandler {
     }
 
     /**
-     * Frame payload (after the request-type byte):
-     *   [2 bytes: topic length][N bytes: topic][4 bytes: msg length][M bytes: msg]
+     * Phase 2 frame payload (after type byte):
+     *   [2B topicLen][N topic]
+     *   [4B keyLen]  — -1 signals "no key" (round-robin), 0 also means no key
+     *   [K key]      — present only when keyLen > 0
+     *   [4B payloadLen][M payload]
+     *
+     * Partition selection:
+     *   key present → murmur2(key) % numPartitions
+     *   key absent  → round-robin counter % numPartitions
+     *
+     * The broker resolves the partition; the client never needs to know the
+     * partition count upfront for produces.
      */
     public ByteBuffer handle(ByteBuffer frame) {
         String topicName = readString(frame);
         if (topicName == null) {
-            return ResponseEncoder.produceAck(ErrorCode.INTERNAL_ERROR, -1);
+            return ResponseEncoder.produceAck(ErrorCode.INTERNAL_ERROR, -1, -1);
         }
 
         if (frame.remaining() < 4) {
-            return ResponseEncoder.produceAck(ErrorCode.INTERNAL_ERROR, -1);
+            return ResponseEncoder.produceAck(ErrorCode.INTERNAL_ERROR, -1, -1);
         }
-        int msgLen = frame.getInt();
-        if (frame.remaining() < msgLen || msgLen < 0) {
-            return ResponseEncoder.produceAck(ErrorCode.INTERNAL_ERROR, -1);
+        int keyLen = frame.getInt();
+        byte[] key = null;
+        if (keyLen > 0) {
+            if (frame.remaining() < keyLen) {
+                return ResponseEncoder.produceAck(ErrorCode.INTERNAL_ERROR, -1, -1);
+            }
+            key = new byte[keyLen];
+            frame.get(key);
         }
-        byte[] message = new byte[msgLen];
-        frame.get(message);
 
-        // Phase 1: single partition per topic (partition 0).
-        Partition partition = topicManager.getPartition(topicName, 0);
+        if (frame.remaining() < 4) {
+            return ResponseEncoder.produceAck(ErrorCode.INTERNAL_ERROR, -1, -1);
+        }
+        int payloadLen = frame.getInt();
+        if (payloadLen < 0 || frame.remaining() < payloadLen) {
+            return ResponseEncoder.produceAck(ErrorCode.INTERNAL_ERROR, -1, -1);
+        }
+        byte[] payload = new byte[payloadLen];
+        frame.get(payload);
+
+        Partition partition = topicManager.route(topicName, key);
         if (partition == null) {
-            return ResponseEncoder.produceAck(ErrorCode.TOPIC_NOT_FOUND, -1);
+            return ResponseEncoder.produceAck(ErrorCode.TOPIC_NOT_FOUND, -1, -1);
         }
 
         try {
-            long offset = partition.append(message);
-            return ResponseEncoder.produceAck(ErrorCode.NONE, offset);
+            long offset = partition.append(payload);
+            return ResponseEncoder.produceAck(ErrorCode.NONE, partition.partitionId, offset);
         } catch (IOException e) {
-            log.severe("Append failed for topic " + topicName + ": " + e.getMessage());
-            return ResponseEncoder.produceAck(ErrorCode.INTERNAL_ERROR, -1);
+            log.severe("Append failed for topic=" + topicName + ": " + e.getMessage());
+            return ResponseEncoder.produceAck(ErrorCode.INTERNAL_ERROR, -1, -1);
         }
     }
 
