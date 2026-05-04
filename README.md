@@ -11,33 +11,65 @@ The system implements the fundamental components of a log-based event streaming 
 - Append-only, sequential disk writes via `FileChannel`
 - Custom binary wire protocol over raw TCP
 - Non-blocking I/O using Java NIO Selector
+- Worker thread pool for parallel request processing and disk I/O
+- Multi-partition topics with Murmur2 hash-based routing
 - O(1) offset-based message retrieval (offset = byte position in log)
-- Concurrent read / serialized write access to storage layer
+- Concurrent reads and serialized writes at the storage layer
 
 ---
 
 ## Architecture
 
 ```
-Producer / Consumer
-       |
-       | TCP (binary protocol)
-       |
+Producers / Consumers
+        |
+        | TCP  (binary protocol)
+        |
   BrokerServer  (single NIO event-loop thread)
-       |
+  accept | read | write only — zero blocking operations
+        |
+        | ArrayBlockingQueue<RequestContext>
+        |
+  Worker Thread Pool  (N = availableProcessors)
+  request decode | disk I/O | response build
+        |
+        | ConcurrentLinkedQueue<PendingChange>  +  selector.wakeup()
+        |
+  BrokerServer writes response to client
+        |
   RequestDispatcher
-  /         |         \
-Create    Produce    Fetch
+  /          |          \
+Create     Produce     Fetch
 Topic
-       |
-  TopicManager  (ConcurrentHashMap, lock-free reads)
-       |
-  Partition  (one per topic in Phase 1)
-       |
-  LogSegment  (FileChannel, append-only)
-       |
-  ~/eventstream-logs/<topic>/partition-0/00000000.log
+        |
+  TopicManager  (ConcurrentHashMap<name, Topic>)
+        |
+  Topic  { Partition[]  +  Murmur2 routing  +  round-robin counter }
+        |
+  Partition  (index == partitionId, O(1) array access)
+        |
+  LogSegment  (FileChannel, append-only, positional reads)
+        |
+  <log-root>/<topic>/partition-N/00000000.log
 ```
+
+### Threading Model
+
+The selector thread and worker threads communicate through two lock-free structures:
+
+```
+Selector thread                          Worker threads
+────────────────                         ─────────────────────────────────
+read → pollFrame()
+  → requestQueue.offer(ctx)  ─────────►  ctx = requestQueue.take()
+                                          dispatch(ctx.frame)  [disk I/O]
+                                          connection.enqueueResponse(buf)
+applyPendingChanges()        ◄─────────  pendingChanges.offer(PendingChange)
+  key.interestOps |= OP_WRITE            selector.wakeup()
+write → drain writeQueue
+```
+
+`SelectionKey.interestOps()` is only ever called from the selector thread. Workers signal interest-op changes via `PendingChange` records drained at the top of every event loop iteration.
 
 ### Wire Protocol
 
@@ -46,18 +78,22 @@ Frame:  [ 4B body-length ][ 1B type ][ payload ... ]
 
 Request types          Response types
   0x01  CREATE_TOPIC     0x81  CREATE_TOPIC_ACK   error(1)
-  0x02  PRODUCE          0x82  PRODUCE_ACK        error(1) + offset(8)
+  0x02  PRODUCE          0x82  PRODUCE_ACK        error(1) + partitionId(4) + offset(8)
   0x03  FETCH            0x83  FETCH_RESPONSE     error(1) + count(4)
                                                   + [offset(8) + len(4) + payload]*
+
+CREATE_TOPIC payload:  topicLen(2) + topic + numPartitions(4)
+PRODUCE payload:       topicLen(2) + topic + keyLen(4) + key? + payloadLen(4) + payload
+FETCH payload:         topicLen(2) + topic + partitionId(4) + startOffset(8) + maxBytes(4)
 ```
 
 ### On-Disk Log Format
 
 ```
-<log-root>/<topic>/partition-0/00000000.log
+<log-root>/<topic>/partition-<N>/00000000.log
   [ 4B length ][ payload ][ 4B length ][ payload ] ...
 
-offset of a record  =  its starting byte position in the file
+offset of a record  =  its starting byte position in the file  (O(1) seek)
 ```
 
 ---
@@ -66,37 +102,43 @@ offset of a record  =  its starting byte position in the file
 
 ```
 event-streaming-system/
-├── common/                         # Shared protocol constants
+├── common/
 │   └── protocol/
-│       ├── RequestType.java        # Request / response type bytes
-│       └── ErrorCode.java          # Error code constants
+│       ├── RequestType.java          # Request / response type bytes
+│       └── ErrorCode.java            # Error code constants
 │
-├── broker/                         # Broker server
+├── broker/
 │   └── broker/
-│       ├── BrokerMain.java         # Entry point, shutdown hook
-│       ├── BrokerConfig.java       # Port and log-directory config
-│       ├── BrokerServer.java       # NIO Selector event loop
+│       ├── BrokerMain.java           # Entry point, shutdown hook
+│       ├── BrokerConfig.java         # Port, log dir, worker count, queue capacity
+│       ├── BrokerServer.java         # NIO Selector event loop (Phase 2: read/write only)
+│       ├── RequestContext.java        # Unit of work: selector → worker
+│       ├── PendingChange.java         # Deferred interest-op mutation: worker → selector
+│       ├── RequestWorker.java         # Worker thread: dispatch + disk I/O + response
 │       ├── network/
-│       │   ├── Connection.java     # Per-connection buffer + write queue
-│       │   └── ResponseEncoder.java# Builds framed response ByteBuffers
+│       │   ├── Connection.java        # Per-connection buffer + ConcurrentLinkedQueue write queue
+│       │   └── ResponseEncoder.java   # Builds framed response ByteBuffers
 │       ├── handler/
 │       │   ├── RequestDispatcher.java
 │       │   ├── CreateTopicHandler.java
 │       │   ├── ProduceHandler.java
 │       │   └── FetchHandler.java
 │       ├── topic/
-│       │   ├── TopicManager.java   # Topic lifecycle, ConcurrentHashMap
-│       │   └── Partition.java      # Thin wrapper over LogSegment
-│       └── storage/
-│           ├── LogSegment.java     # Append-only FileChannel log
-│           └── LogEntry.java       # Read result (offset + payload)
+│       │   ├── TopicManager.java      # Topic lifecycle
+│       │   ├── Topic.java             # Partition[] array + Murmur2 routing
+│       │   └── Partition.java         # Thin wrapper over LogSegment
+│       ├── storage/
+│       │   ├── LogSegment.java        # Append-only FileChannel log
+│       │   └── LogEntry.java          # Read result (offset + payload)
+│       └── util/
+│           └── Murmur2.java           # 32-bit hash for partition routing
 │
-└── client/                         # Producer and consumer library
+└── client/
     └── client/
-        ├── BrokerConnection.java   # Blocking socket, length-prefix framing
-        ├── Producer.java           # Synchronous producer API
-        ├── Consumer.java           # Polling consumer API
-        ├── FetchResult.java        # Returned by Consumer.poll()
+        ├── BrokerConnection.java      # Blocking socket, length-prefix framing
+        ├── Producer.java              # Synchronous producer (key-routed or round-robin)
+        ├── Consumer.java              # Polling consumer (per-partition + pollAll)
+        ├── FetchResult.java           # partitionId + messages + nextOffset
         └── demo/
             ├── ProducerDemo.java
             └── ConsumerDemo.java
@@ -106,20 +148,26 @@ event-streaming-system/
 
 ## Design Decisions
 
-**Single event-loop thread**
-One thread drives the NIO Selector for all accept / read / write events. There is no synchronization on the hot path. The only blocking call is the disk write inside `LogSegment`, which completes in microseconds against the kernel page cache. A worker thread pool (Phase 2) will offload request processing to allow parallel partition I/O.
+**Selector thread handles only I/O — never business logic**
+The NIO Selector thread accepts connections, assembles frames, and drains write queues. All request processing and disk I/O happens on worker threads. This eliminates head-of-line blocking: a slow disk write on one partition cannot stall reads for other connections.
+
+**`ArrayBlockingQueue` for selector-to-worker handoff**
+Bounded capacity gives built-in back-pressure. When the queue is full, `OP_READ` is suspended for the producing connection — TCP flow control propagates the signal back to the sender at no extra cost. The queue resumes reads once it drains below 80% capacity.
+
+**`ConcurrentLinkedQueue<PendingChange>` for worker-to-selector signalling**
+Workers must never call `SelectionKey.interestOps()` directly; that method is not safe to call concurrently with `Selector.select()`. Instead, workers post a `PendingChange` record and call `selector.wakeup()`. The selector drains the queue at the top of every loop iteration and applies changes in its own thread.
+
+**`Partition[]` array instead of `ConcurrentHashMap<Integer, Partition>`**
+Partitions are fixed at topic creation time. An array indexed by partition id is O(1) with no hashing overhead on every produce and fetch call.
+
+**Murmur2 for partition routing**
+Java's `String.hashCode()` has poor low-bit distribution, which causes hot partitions with certain key patterns. Murmur2 (the same algorithm Kafka uses) produces a uniform 32-bit output, yielding balanced partition load regardless of key structure.
 
 **Offset = byte position**
-Seeking to any offset is O(1) via `FileChannel.read(buffer, offset)`. No index file is required in Phase 1. Phase 2 will introduce a `.index` file mapping logical message numbers to byte positions, matching Kafka's approach.
-
-**Conditional OP_WRITE interest**
-Write interest on a channel is registered only when the write queue is non-empty and cleared the moment the queue drains. This avoids busy-spinning on writable-but-idle channels, a common mistake in NIO code.
+`FileChannel.read(buffer, offset)` seeks to any position in O(1) — no index file is needed. Phase 3 will introduce a `.index` file mapping logical message numbers to byte positions for human-friendly sequential offsets.
 
 **Concurrent reads, serialized writes**
-`FileChannel.read(buf, position)` is thread-safe per the Java NIO specification — multiple consumers read concurrently without locks. All writes hold `writeLock` and advance `AtomicLong writePosition` only after the write loop completes, so readers never observe a partially-written record.
-
-**Race-free topic creation**
-`TopicManager` builds the `Partition` fully before calling `ConcurrentHashMap.putIfAbsent`. If two threads race, the losing thread closes its extra segment. Callers never observe a topic that lacks partition 0.
+`FileChannel.read(buf, position)` is thread-safe per the Java NIO specification — multiple consumers read concurrently with no locks. All appends hold `ReentrantLock writeLock` and advance `AtomicLong writePosition` only after the write loop completes, so readers never observe a partial record.
 
 ---
 
@@ -146,77 +194,94 @@ mvn clean package -q
 java -jar broker/target/broker-1.0.0-SNAPSHOT.jar
 ```
 
-Optional flags:
+All flags and their defaults:
 
 ```bash
-java -jar broker/target/broker-1.0.0-SNAPSHOT.jar --port 9093 --logdir /tmp/logs
+java -jar broker/target/broker-1.0.0-SNAPSHOT.jar \
+  --port 9092          \
+  --logdir ~/eventstream-logs \
+  --workers 8          \
+  --queue-cap 10000    \
+  --partitions 1
 ```
 
-**Run the producer demo** (in a separate terminal)
+**Run the producer demo**
 
 ```bash
 java -cp client/target/client-1.0.0-SNAPSHOT.jar \
      com.eventstream.client.demo.ProducerDemo
 ```
 
-**Run the consumer demo** (in a separate terminal)
+**Run the consumer demo**
 
 ```bash
 java -cp client/target/client-1.0.0-SNAPSHOT.jar \
      com.eventstream.client.demo.ConsumerDemo
 ```
 
-The consumer can be started before the producer. It will poll with 200ms back-off and pick up messages as they arrive.
-
 ---
 
 ## Expected Output
 
-Producer:
+Producer (Phase 2 — 4 partitions, key-routed):
 ```
-Connecting to broker at localhost:9092
-Topic 'demo-topic' ready
-  sent [ 1] offset=0       message-1 | timestamp=...
-  sent [ 2] offset=50      message-2 | timestamp=...
+Topic 'demo-topic' ready (4 partitions)
+
+Key-routed messages:
+  key=user-1    partition=2  offset=0       event-1 for user-1
+  key=user-2    partition=0  offset=0       event-2 for user-2
+  key=user-3    partition=3  offset=0       event-3 for user-3
+  key=user-1    partition=2  offset=46      event-4 for user-1   <- same key, same partition
+  ...
+
+Round-robin messages (no key):
+  partition=0  offset=46      broadcast-1
+  partition=1  offset=0       broadcast-2
+  partition=2  offset=92      broadcast-3
+  partition=3  offset=46      broadcast-4
   ...
 ```
 
-Consumer:
+Consumer (Phase 2 — reads all 4 partitions):
 ```
-Connecting to broker at localhost:9092
-Reading from topic 'demo-topic' (offset 0) ...
-  [msg  1 @ offset 0     ]  message-1 | timestamp=...
-  [msg  2 @ offset 50    ]  message-2 | timestamp=...
+Reading from topic 'demo-topic' (4 partitions)
+
+  [msg   1]  partition=0  offset=0       event-2 for user-2
+  [msg   2]  partition=1  offset=0       broadcast-2
+  [msg   3]  partition=2  offset=0       event-1 for user-1
   ...
+
+Final offsets per partition:
+  partition-0: 184 bytes consumed
+  partition-1: 92 bytes consumed
+  partition-2: 276 bytes consumed
+  partition-3: 138 bytes consumed
 ```
 
 ---
 
 ## Roadmap
 
-**Phase 2 — Partitioning**
-- Multiple partitions per topic
-- Hash-based producer routing (`murmur2(key) % partitions`)
-- Segment index file for logical offset mapping
-- Worker thread pool for parallel partition I/O
-
 **Phase 3 — Consumer Groups**
-- Shared partition assignment across consumer instances
+- Broker-managed partition assignment across consumer instances
 - Offset tracking per consumer group
+- Rebalance protocol on consumer join / leave
 
 **Phase 4 — Replication**
-- Leader / follower model
-- Basic failover
+- Leader / follower model per partition
+- In-sync replica set (ISR)
+- Basic failover on leader failure
 
 **Phase 5 — Performance**
-- Batch writes
+- Batch writes and read-ahead
 - Zero-copy path (`FileChannel.transferTo`)
-- Syscall reduction
-- JMH benchmarks
+- Syscall reduction and write coalescing
+- JMH benchmarks (throughput and latency)
 
 ---
 
 ## Status
 
-Phase 1 — Complete  
-Phase 2 — In progress
+Phase 1 — Complete
+Phase 2 — Complete
+Phase 3 — In progress
