@@ -7,20 +7,26 @@ public final class BrokerConfig {
     public final int    workerThreads;
     public final int    requestQueueCapacity;
     public final int    defaultPartitions;
+    public final int    sessionTimeoutMs;
+    public final int    reaperIntervalMs;
 
     public BrokerConfig(int port, String logDirectory, int workerThreads,
-                        int requestQueueCapacity, int defaultPartitions) {
+                        int requestQueueCapacity, int defaultPartitions,
+                        int sessionTimeoutMs, int reaperIntervalMs) {
         this.port                 = port;
         this.logDirectory         = logDirectory;
         this.workerThreads        = workerThreads;
         this.requestQueueCapacity = requestQueueCapacity;
         this.defaultPartitions    = defaultPartitions;
+        this.sessionTimeoutMs     = sessionTimeoutMs;
+        this.reaperIntervalMs     = reaperIntervalMs;
     }
 
     public static BrokerConfig defaults() {
         String home = System.getProperty("user.home");
         int    cpus = Runtime.getRuntime().availableProcessors();
-        return new BrokerConfig(9092, home + "/eventstream-logs", cpus, 10_000, 1);
+        return new BrokerConfig(9092, home + "/eventstream-logs",
+                cpus, 10_000, 1, 30_000, 1_000);
     }
 
     public static BrokerConfig fromArgs(String[] args) {
@@ -29,16 +35,20 @@ public final class BrokerConfig {
         int    workers      = Runtime.getRuntime().availableProcessors();
         int    queueCap     = 10_000;
         int    defaultParts = 1;
+        int    sessionMs    = 30_000;
+        int    reaperMs     = 1_000;
 
         for (int i = 0; i < args.length - 1; i++) {
             switch (args[i]) {
-                case "--port"       -> port         = Integer.parseInt(args[i + 1]);
-                case "--logdir"     -> logDir       = args[i + 1];
-                case "--workers"    -> workers      = Integer.parseInt(args[i + 1]);
-                case "--queue-cap"  -> queueCap     = Integer.parseInt(args[i + 1]);
-                case "--partitions" -> defaultParts = Integer.parseInt(args[i + 1]);
+                case "--port"            -> port         = Integer.parseInt(args[i + 1]);
+                case "--logdir"          -> logDir       = args[i + 1];
+                case "--workers"         -> workers      = Integer.parseInt(args[i + 1]);
+                case "--queue-cap"       -> queueCap     = Integer.parseInt(args[i + 1]);
+                case "--partitions"      -> defaultParts = Integer.parseInt(args[i + 1]);
+                case "--session-timeout" -> sessionMs    = Integer.parseInt(args[i + 1]);
+                case "--reaper-interval" -> reaperMs     = Integer.parseInt(args[i + 1]);
             }
         }
-        return new BrokerConfig(port, logDir, workers, queueCap, defaultParts);
+        return new BrokerConfig(port, logDir, workers, queueCap, defaultParts, sessionMs, reaperMs);
     }
 }

@@ -1,5 +1,6 @@
 package com.eventstream.broker;
 
+import com.eventstream.broker.group.ConsumerGroupManager;
 import com.eventstream.broker.handler.RequestDispatcher;
 import com.eventstream.broker.network.Connection;
 import com.eventstream.broker.topic.TopicManager;
@@ -17,7 +18,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
 
 /**
- * NIO event loop — Phase 2.
+ * NIO event loop — Phase 3 (unchanged from Phase 2 structurally).
  *
  * Phase 1 recap: selector thread did everything (accept, read, dispatch, disk I/O, write).
  *
@@ -71,9 +72,10 @@ public final class BrokerServer {
 
     private ExecutorService workerPool;
 
-    public BrokerServer(BrokerConfig config, TopicManager topicManager) {
+    public BrokerServer(BrokerConfig config, TopicManager topicManager,
+                        ConsumerGroupManager groupManager) {
         this.config       = config;
-        this.dispatcher   = new RequestDispatcher(topicManager);
+        this.dispatcher   = new RequestDispatcher(topicManager, groupManager);
         this.requestQueue = new ArrayBlockingQueue<>(config.requestQueueCapacity);
     }
 

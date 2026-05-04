@@ -15,6 +15,9 @@ The system implements the fundamental components of a log-based event streaming 
 - Multi-partition topics with Murmur2 hash-based routing
 - O(1) offset-based message retrieval (offset = byte position in log)
 - Concurrent reads and serialized writes at the storage layer
+- Broker-managed consumer groups with automatic partition assignment
+- Generational rebalance protocol with stale-consumer detection
+- Per-group offset persistence with atomic commit semantics
 
 ---
 
@@ -38,9 +41,9 @@ Producers / Consumers
   BrokerServer writes response to client
         |
   RequestDispatcher
-  /          |          \
-Create     Produce     Fetch
-Topic
+  /      |      |       |      |       |      |       \
+Create Produce Fetch  Join  Leave Heart- Offset Offset
+Topic               Group  Group  beat  Commit Fetch
         |
   TopicManager  (ConcurrentHashMap<name, Topic>)
         |
@@ -51,6 +54,16 @@ Topic
   LogSegment  (FileChannel, append-only, positional reads)
         |
   <log-root>/<topic>/partition-N/00000000.log
+
+  ConsumerGroupManager  (ConcurrentHashMap<groupId, ConsumerGroup>)
+        |
+  ConsumerGroup
+    state: volatile GroupState  (EMPTY | REBALANCING | STABLE)
+    partitionOwner: volatile String[]  (lock-free ownership reads)
+    committedOffsets: AtomicLongArray  (lock-free offset commits)
+    members: ConcurrentHashMap<consumerId, ConsumerMember>
+    rebalanceLock: ReentrantLock  (serialises join/leave/rebalance)
+    generationId: int  (incremented on every rebalance)
 ```
 
 ### Threading Model
@@ -76,15 +89,32 @@ write → drain writeQueue
 ```
 Frame:  [ 4B body-length ][ 1B type ][ payload ... ]
 
-Request types          Response types
-  0x01  CREATE_TOPIC     0x81  CREATE_TOPIC_ACK   error(1)
-  0x02  PRODUCE          0x82  PRODUCE_ACK        error(1) + partitionId(4) + offset(8)
-  0x03  FETCH            0x83  FETCH_RESPONSE     error(1) + count(4)
-                                                  + [offset(8) + len(4) + payload]*
+Request types           Response types
+  0x01  CREATE_TOPIC      0x81  CREATE_TOPIC_ACK    error(1)
+  0x02  PRODUCE           0x82  PRODUCE_ACK         error(1) + partitionId(4) + offset(8)
+  0x03  FETCH             0x83  FETCH_RESPONSE      error(1) + count(4)
+                                                    + [offset(8) + len(4) + payload]*
+  0x04  JOIN_GROUP        0x84  JOIN_GROUP_ACK      error(1) + generationId(4) + count(4)
+                                                    + [partitionId(4)]*
+  0x05  LEAVE_GROUP       0x85  LEAVE_GROUP_ACK     error(1)
+  0x06  HEARTBEAT         0x86  HEARTBEAT_ACK       error(1)
+  0x07  OFFSET_COMMIT     0x87  OFFSET_COMMIT_ACK   error(1)
+  0x08  OFFSET_FETCH      0x88  OFFSET_FETCH_ACK    error(1) + offset(8)
 
-CREATE_TOPIC payload:  topicLen(2) + topic + numPartitions(4)
-PRODUCE payload:       topicLen(2) + topic + keyLen(4) + key? + payloadLen(4) + payload
-FETCH payload:         topicLen(2) + topic + partitionId(4) + startOffset(8) + maxBytes(4)
+CREATE_TOPIC payload:    topicLen(2) + topic + numPartitions(4)
+PRODUCE payload:         topicLen(2) + topic + keyLen(4) + key? + payloadLen(4) + payload
+FETCH payload:           topicLen(2) + topic + groupIdLen(2) + groupId + consumerIdLen(2)
+                         + consumerId + generationId(4) + partitionId(4)
+                         + startOffset(8) + maxBytes(4)
+JOIN_GROUP payload:      groupIdLen(2) + groupId + consumerIdLen(2) + consumerId
+                         + topicLen(2) + topic + sessionTimeoutMs(4)
+LEAVE_GROUP payload:     groupIdLen(2) + groupId + consumerIdLen(2) + consumerId
+HEARTBEAT payload:       groupIdLen(2) + groupId + consumerIdLen(2) + consumerId
+                         + generationId(4)
+OFFSET_COMMIT payload:   groupIdLen(2) + groupId + consumerIdLen(2) + consumerId
+                         + generationId(4) + partitionId(4) + offset(8)
+OFFSET_FETCH payload:    groupIdLen(2) + groupId + consumerIdLen(2) + consumerId
+                         + partitionId(4)
 ```
 
 ### On-Disk Log Format
@@ -110,38 +140,51 @@ event-streaming-system/
 ├── broker/
 │   └── broker/
 │       ├── BrokerMain.java           # Entry point, shutdown hook
-│       ├── BrokerConfig.java         # Port, log dir, worker count, queue capacity
-│       ├── BrokerServer.java         # NIO Selector event loop (Phase 2: read/write only)
-│       ├── RequestContext.java        # Unit of work: selector → worker
-│       ├── PendingChange.java         # Deferred interest-op mutation: worker → selector
-│       ├── RequestWorker.java         # Worker thread: dispatch + disk I/O + response
+│       ├── BrokerConfig.java         # Port, log dir, worker count, session timeout
+│       ├── BrokerServer.java         # NIO Selector event loop (read/write only)
+│       ├── RequestContext.java       # Unit of work: selector → worker
+│       ├── PendingChange.java        # Deferred interest-op mutation: worker → selector
+│       ├── RequestWorker.java        # Worker thread: dispatch + disk I/O + response
 │       ├── network/
-│       │   ├── Connection.java        # Per-connection buffer + ConcurrentLinkedQueue write queue
-│       │   └── ResponseEncoder.java   # Builds framed response ByteBuffers
+│       │   ├── Connection.java       # Per-connection buffer + ConcurrentLinkedQueue write queue
+│       │   └── ResponseEncoder.java  # Builds framed response ByteBuffers
 │       ├── handler/
 │       │   ├── RequestDispatcher.java
 │       │   ├── CreateTopicHandler.java
 │       │   ├── ProduceHandler.java
-│       │   └── FetchHandler.java
+│       │   ├── FetchHandler.java     # Group-aware: validates ownership and generation
+│       │   ├── JoinGroupHandler.java
+│       │   ├── LeaveGroupHandler.java
+│       │   ├── HeartbeatHandler.java
+│       │   ├── OffsetCommitHandler.java
+│       │   └── OffsetFetchHandler.java
+│       ├── group/
+│       │   ├── GroupState.java       # EMPTY | REBALANCING | STABLE
+│       │   ├── ConsumerMember.java   # Per-consumer liveness and assignment state
+│       │   ├── ConsumerGroup.java    # Group state machine, rebalance, fetch validation
+│       │   ├── RoundRobinAssignor.java  # Deterministic partition assignment
+│       │   └── ConsumerGroupManager.java  # Group lifecycle + heartbeat reaper
 │       ├── topic/
-│       │   ├── TopicManager.java      # Topic lifecycle
-│       │   ├── Topic.java             # Partition[] array + Murmur2 routing
-│       │   └── Partition.java         # Thin wrapper over LogSegment
+│       │   ├── TopicManager.java     # Topic lifecycle
+│       │   ├── Topic.java            # Partition[] array + Murmur2 routing
+│       │   └── Partition.java        # Thin wrapper over LogSegment
 │       ├── storage/
-│       │   ├── LogSegment.java        # Append-only FileChannel log
-│       │   └── LogEntry.java          # Read result (offset + payload)
+│       │   ├── LogSegment.java       # Append-only FileChannel log
+│       │   └── LogEntry.java         # Read result (offset + payload)
 │       └── util/
-│           └── Murmur2.java           # 32-bit hash for partition routing
+│           └── Murmur2.java          # 32-bit hash for partition routing
 │
 └── client/
     └── client/
-        ├── BrokerConnection.java      # Blocking socket, length-prefix framing
-        ├── Producer.java              # Synchronous producer (key-routed or round-robin)
-        ├── Consumer.java              # Polling consumer (per-partition + pollAll)
-        ├── FetchResult.java           # partitionId + messages + nextOffset
+        ├── BrokerConnection.java     # Blocking socket, length-prefix framing
+        ├── Producer.java             # Synchronous producer (key-routed or round-robin)
+        ├── Consumer.java             # Polling consumer — plain and group-aware
+        ├── FetchResult.java          # partitionId + messages + nextOffset
+        ├── RebalanceException.java   # Thrown when broker signals rebalance
         └── demo/
             ├── ProducerDemo.java
-            └── ConsumerDemo.java
+            ├── ConsumerDemo.java
+            └── ConsumerGroupDemo.java
 ```
 
 ---
@@ -164,10 +207,25 @@ Partitions are fixed at topic creation time. An array indexed by partition id is
 Java's `String.hashCode()` has poor low-bit distribution, which causes hot partitions with certain key patterns. Murmur2 (the same algorithm Kafka uses) produces a uniform 32-bit output, yielding balanced partition load regardless of key structure.
 
 **Offset = byte position**
-`FileChannel.read(buffer, offset)` seeks to any position in O(1) — no index file is needed. Phase 3 will introduce a `.index` file mapping logical message numbers to byte positions for human-friendly sequential offsets.
+`FileChannel.read(buffer, offset)` seeks to any position in O(1) — no index file is needed. Phase 4 may introduce a sparse `.index` file mapping logical message numbers to byte positions.
 
 **Concurrent reads, serialized writes**
 `FileChannel.read(buf, position)` is thread-safe per the Java NIO specification — multiple consumers read concurrently with no locks. All appends hold `ReentrantLock writeLock` and advance `AtomicLong writePosition` only after the write loop completes, so readers never observe a partial record.
+
+**Lock-free fetch validation via `volatile String[] partitionOwner`**
+The hot fetch path — every consumer poll — must not contend on the rebalance lock. The current partition-to-consumer mapping is stored in a `volatile String[]`. A rebalance writes a fully constructed array in a single volatile store; every fetch reads it with a single volatile load. Ownership is confirmed with a reference equality check, requiring no lock.
+
+**`generationId` for stale consumer detection**
+Every rebalance increments a `generationId`. Fetch, commit, and heartbeat requests carry this value. A mismatch returns `REBALANCE_IN_PROGRESS`, forcing the consumer to call `joinGroup()` again. This prevents a slow consumer from committing offsets on behalf of a partition it no longer owns after losing it in a rebalance.
+
+**`AtomicLongArray` for committed offsets**
+Each `ConsumerGroup` holds one `AtomicLongArray` sized to the topic's partition count. `commitOffset` is a single `AtomicLongArray.set()` — no lock, no contention between consumers committing on different partitions simultaneously.
+
+**Stop-the-world rebalance under `ReentrantLock`**
+Rebalance events (join and leave) are infrequent relative to fetch throughput. Serialising them under a `ReentrantLock` keeps the state machine simple and avoids the complexity of concurrent membership changes. The lock is held only for the duration of assignment computation and a single volatile array swap — typically microseconds.
+
+**Heartbeat reaper via `ScheduledExecutorService`**
+A single daemon thread runs every second (configurable) and evicts members whose `lastHeartbeatMs` exceeds the session timeout. Evictions trigger an automatic rebalance, reassigning orphaned partitions to surviving members.
 
 ---
 
@@ -198,11 +256,13 @@ All flags and their defaults:
 
 ```bash
 java -jar broker/target/broker-1.0.0-SNAPSHOT.jar \
-  --port 9092          \
+  --port 9092                \
   --logdir ~/eventstream-logs \
-  --workers 8          \
-  --queue-cap 10000    \
-  --partitions 1
+  --workers 8                \
+  --queue-cap 10000          \
+  --partitions 1             \
+  --session-timeout 30000    \
+  --reaper-interval 1000
 ```
 
 **Run the producer demo**
@@ -212,60 +272,72 @@ java -cp client/target/client-1.0.0-SNAPSHOT.jar \
      com.eventstream.client.demo.ProducerDemo
 ```
 
-**Run the consumer demo**
+**Run the consumer demo (plain, no group)**
 
 ```bash
 java -cp client/target/client-1.0.0-SNAPSHOT.jar \
      com.eventstream.client.demo.ConsumerDemo
 ```
 
+**Run the consumer group demo**
+
+```bash
+java -cp client/target/client-1.0.0-SNAPSHOT.jar \
+     com.eventstream.client.demo.ConsumerGroupDemo
+```
+
 ---
 
 ## Expected Output
 
-Producer (Phase 2 — 4 partitions, key-routed):
+**Producer demo (4 partitions, key-routed):**
 ```
 Topic 'demo-topic' ready (4 partitions)
 
 Key-routed messages:
   key=user-1    partition=2  offset=0       event-1 for user-1
   key=user-2    partition=0  offset=0       event-2 for user-2
-  key=user-3    partition=3  offset=0       event-3 for user-3
-  key=user-1    partition=2  offset=46      event-4 for user-1   <- same key, same partition
+  key=user-1    partition=2  offset=46      event-4 for user-1  <- same key, same partition
   ...
 
 Round-robin messages (no key):
   partition=0  offset=46      broadcast-1
   partition=1  offset=0       broadcast-2
-  partition=2  offset=92      broadcast-3
-  partition=3  offset=46      broadcast-4
   ...
 ```
 
-Consumer (Phase 2 — reads all 4 partitions):
+**Consumer group demo (2 consumers, 4 partitions, rebalance):**
 ```
-Reading from topic 'demo-topic' (4 partitions)
+Consumer A joined   | assigned: [0, 1, 2, 3]
+Consumer B joined   | assigned: [2, 3]
+Consumer A re-joined | assigned: [0, 1]
 
-  [msg   1]  partition=0  offset=0       event-2 for user-2
-  [msg   2]  partition=1  offset=0       broadcast-2
-  [msg   3]  partition=2  offset=0       event-1 for user-1
+--- Consumer A draining ---
+  [consumer-A | partition 0] msg-p0-1
   ...
+  => consumer-A received 20 messages total
 
-Final offsets per partition:
-  partition-0: 184 bytes consumed
-  partition-1: 92 bytes consumed
-  partition-2: 276 bytes consumed
-  partition-3: 138 bytes consumed
+--- Consumer B draining ---
+  [consumer-B | partition 2] msg-p2-1
+  ...
+  => consumer-B received 20 messages total
+
+Consumer A leaving the group...
+Consumer B re-joined after A left | assigned: [0, 1, 2, 3]
+
+--- Consumer B polling after A left (expects 0 messages) ---
+  => consumer-B received 0 messages total
+
+--- Consumer C joins (should see 0 unread messages) ---
+Consumer C assigned: [0, 1, 2, 3]
+  => consumer-C received 0 messages total
+
+Demo complete.
 ```
 
 ---
 
 ## Roadmap
-
-**Phase 3 — Consumer Groups**
-- Broker-managed partition assignment across consumer instances
-- Offset tracking per consumer group
-- Rebalance protocol on consumer join / leave
 
 **Phase 4 — Replication**
 - Leader / follower model per partition
@@ -284,4 +356,6 @@ Final offsets per partition:
 
 Phase 1 — Complete
 Phase 2 — Complete
-Phase 3 — In progress
+Phase 3 — Complete
+Phase 4 — Planned
+Phase 5 — Planned

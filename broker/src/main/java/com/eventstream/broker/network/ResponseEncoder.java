@@ -11,18 +11,14 @@ import java.util.List;
  *
  * Wire format for all responses:
  *   [4 bytes: body length][1 byte: response type][1 byte: error code][optional payload]
- *
- * Phase 2 change: produceAck now includes the partitionId so producers know
- * which partition accepted their message (important for key-based routing).
- *
- *   PRODUCE_ACK body: type(1) + error(1) + partitionId(4) + offset(8) = 14 bytes
  */
 public final class ResponseEncoder {
 
     private ResponseEncoder() {}
 
+    // ---- Phase 1 / 2 ----
+
     public static ByteBuffer createTopicAck(byte errorCode) {
-        // body = type(1) + error(1) = 2
         ByteBuffer buf = ByteBuffer.allocate(4 + 2);
         buf.putInt(2);
         buf.put(RequestType.CREATE_TOPIC_ACK);
@@ -44,7 +40,6 @@ public final class ResponseEncoder {
     }
 
     public static ByteBuffer fetchResponse(byte errorCode, List<LogEntry> entries) {
-        // body = type(1) + error(1) + count(4) + per-entry: offset(8)+len(4)+payload
         int payloadBytes = 0;
         for (LogEntry e : entries) payloadBytes += 8 + 4 + e.payload.length;
         int bodyLen = 1 + 1 + 4 + payloadBytes;
@@ -59,6 +54,43 @@ public final class ResponseEncoder {
             buf.putInt(e.payload.length);
             buf.put(e.payload);
         }
+        buf.flip();
+        return buf;
+    }
+
+    // ---- Phase 3 ----
+
+    public static ByteBuffer joinGroupAck(byte errorCode, int generationId, int[] partitions) {
+        // body = type(1) + error(1) + generationId(4) + count(4) + partitionId[](4*N)
+        int bodyLen = 1 + 1 + 4 + 4 + partitions.length * 4;
+        ByteBuffer buf = ByteBuffer.allocate(4 + bodyLen);
+        buf.putInt(bodyLen);
+        buf.put(RequestType.JOIN_GROUP_ACK);
+        buf.put(errorCode);
+        buf.putInt(generationId);
+        buf.putInt(partitions.length);
+        for (int p : partitions) buf.putInt(p);
+        buf.flip();
+        return buf;
+    }
+
+    /** Generic 2-byte body response: type + error. Used by leave, heartbeat, offset-commit. */
+    public static ByteBuffer groupAck(byte responseType, byte errorCode) {
+        ByteBuffer buf = ByteBuffer.allocate(4 + 2);
+        buf.putInt(2);
+        buf.put(responseType);
+        buf.put(errorCode);
+        buf.flip();
+        return buf;
+    }
+
+    public static ByteBuffer offsetFetchAck(byte errorCode, long offset) {
+        // body = type(1) + error(1) + offset(8) = 10
+        ByteBuffer buf = ByteBuffer.allocate(4 + 10);
+        buf.putInt(10);
+        buf.put(RequestType.OFFSET_FETCH_ACK);
+        buf.put(errorCode);
+        buf.putLong(offset);
         buf.flip();
         return buf;
     }
