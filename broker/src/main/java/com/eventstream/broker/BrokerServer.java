@@ -1,5 +1,6 @@
 package com.eventstream.broker;
 
+import com.eventstream.broker.cluster.ReplicationManager;
 import com.eventstream.broker.group.ConsumerGroupManager;
 import com.eventstream.broker.handler.RequestDispatcher;
 import com.eventstream.broker.network.Connection;
@@ -73,9 +74,10 @@ public final class BrokerServer {
     private ExecutorService workerPool;
 
     public BrokerServer(BrokerConfig config, TopicManager topicManager,
-                        ConsumerGroupManager groupManager) {
+                        ConsumerGroupManager groupManager,
+                        ReplicationManager replicationManager) {
         this.config       = config;
-        this.dispatcher   = new RequestDispatcher(topicManager, groupManager);
+        this.dispatcher   = new RequestDispatcher(topicManager, groupManager, replicationManager);
         this.requestQueue = new ArrayBlockingQueue<>(config.requestQueueCapacity);
     }
 

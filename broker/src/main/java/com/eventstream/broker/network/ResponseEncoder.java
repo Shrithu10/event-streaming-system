@@ -1,9 +1,11 @@
 package com.eventstream.broker.network;
 
 import com.eventstream.broker.storage.LogEntry;
+import com.eventstream.common.protocol.ClusterConfig;
 import com.eventstream.common.protocol.RequestType;
 
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 /**
@@ -97,5 +99,88 @@ public final class ResponseEncoder {
 
     public static ByteBuffer errorResponse(byte errorCode) {
         return createTopicAck(errorCode);
+    }
+
+    // ---- Phase 4 ----
+
+    /**
+     * REPLICA_FETCH_ACK:
+     *   type(1) + error(1) + leaderEndOffset(8) + count(4) + [offset(8) + len(4) + payload]*
+     */
+    public static ByteBuffer replicaFetchAck(byte errorCode, long leaderEndOffset,
+                                              List<LogEntry> entries) {
+        int payloadBytes = 0;
+        for (LogEntry e : entries) payloadBytes += 8 + 4 + e.payload.length;
+        int bodyLen = 1 + 1 + 8 + 4 + payloadBytes;
+
+        ByteBuffer buf = ByteBuffer.allocate(4 + bodyLen);
+        buf.putInt(bodyLen);
+        buf.put(RequestType.REPLICA_FETCH_ACK);
+        buf.put(errorCode);
+        buf.putLong(leaderEndOffset);
+        buf.putInt(entries.size());
+        for (LogEntry e : entries) {
+            buf.putLong(e.offset);
+            buf.putInt(e.payload.length);
+            buf.put(e.payload);
+        }
+        buf.flip();
+        return buf;
+    }
+
+    /**
+     * METADATA_ACK:
+     *   type(1) + error(1)
+     *   + brokerCount(4) + [brokerId(4) + hostLen(2) + host + port(4)]*
+     *   + assignCount(4) + [topicLen(2) + topic + partitionId(4) + leaderId(4)
+     *                        + followerCount(4) + [followerId(4)]*]*
+     */
+    public static ByteBuffer metadataAck(byte errorCode,
+                                          List<ClusterConfig.BrokerInfo> brokers,
+                                          List<ClusterConfig.PartitionAssignment> assignments) {
+        // Pre-encode strings so we can calculate sizes.
+        byte[][] hostBytes  = new byte[brokers.size()][];
+        byte[][] topicBytes = new byte[assignments.size()][];
+        for (int i = 0; i < brokers.size(); i++)
+            hostBytes[i] = brokers.get(i).host().getBytes(StandardCharsets.UTF_8);
+        for (int i = 0; i < assignments.size(); i++)
+            topicBytes[i] = assignments.get(i).topic().getBytes(StandardCharsets.UTF_8);
+
+        int brokerBytes = 0;
+        for (byte[] hb : hostBytes) brokerBytes += 4 + 2 + hb.length + 4;
+        int assignBytes = 0;
+        for (int i = 0; i < assignments.size(); i++) {
+            assignBytes += 2 + topicBytes[i].length + 4 + 4 + 4
+                    + assignments.get(i).followerIds().length * 4;
+        }
+        int bodyLen = 1 + 1 + 4 + brokerBytes + 4 + assignBytes;
+
+        ByteBuffer buf = ByteBuffer.allocate(4 + bodyLen);
+        buf.putInt(bodyLen);
+        buf.put(RequestType.METADATA_ACK);
+        buf.put(errorCode);
+
+        buf.putInt(brokers.size());
+        for (int i = 0; i < brokers.size(); i++) {
+            ClusterConfig.BrokerInfo b = brokers.get(i);
+            buf.putInt(b.brokerId());
+            buf.putShort((short) hostBytes[i].length);
+            buf.put(hostBytes[i]);
+            buf.putInt(b.port());
+        }
+
+        buf.putInt(assignments.size());
+        for (int i = 0; i < assignments.size(); i++) {
+            ClusterConfig.PartitionAssignment a = assignments.get(i);
+            buf.putShort((short) topicBytes[i].length);
+            buf.put(topicBytes[i]);
+            buf.putInt(a.partitionId());
+            buf.putInt(a.leaderId());
+            buf.putInt(a.followerIds().length);
+            for (int fid : a.followerIds()) buf.putInt(fid);
+        }
+
+        buf.flip();
+        return buf;
     }
 }

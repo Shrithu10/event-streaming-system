@@ -14,6 +14,10 @@ public final class RequestType {
     public static final byte OFFSET_COMMIT  = 0x07;
     public static final byte OFFSET_FETCH   = 0x08;
 
+    // ---- Phase 4 requests ----
+    public static final byte REPLICA_FETCH  = 0x09;
+    public static final byte METADATA       = 0x0A;
+
     // ---- Phase 1 / 2 responses ----
     public static final byte CREATE_TOPIC_ACK = (byte) 0x81;
     public static final byte PRODUCE_ACK      = (byte) 0x82;
@@ -25,6 +29,10 @@ public final class RequestType {
     public static final byte HEARTBEAT_ACK      = (byte) 0x86;
     public static final byte OFFSET_COMMIT_ACK  = (byte) 0x87;
     public static final byte OFFSET_FETCH_ACK   = (byte) 0x88;
+
+    // ---- Phase 4 responses ----
+    public static final byte REPLICA_FETCH_ACK  = (byte) 0x89;
+    public static final byte METADATA_ACK       = (byte) 0x8A;
 
     private RequestType() {}
 }

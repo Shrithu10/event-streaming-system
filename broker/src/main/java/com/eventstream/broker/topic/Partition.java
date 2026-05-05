@@ -38,6 +38,11 @@ public final class Partition implements Closeable {
         return segment.size();
     }
 
+    /** Byte offset of the next record to be written (used to initialise HW tracking). */
+    public long writePosition() {
+        return segment.size();
+    }
+
     @Override
     public void close() throws IOException {
         segment.close();

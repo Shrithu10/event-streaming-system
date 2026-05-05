@@ -18,6 +18,10 @@ The system implements the fundamental components of a log-based event streaming 
 - Broker-managed consumer groups with automatic partition assignment
 - Generational rebalance protocol with stale-consumer detection
 - Per-group offset persistence with atomic commit semantics
+- Multi-broker cluster with static configuration
+- Pull-based leader–follower replication per partition
+- High Watermark tracking — consumers read only fully replicated records
+- Deterministic leader election on follower timeout (lowest brokerId wins)
 
 ---
 
@@ -64,6 +68,28 @@ Topic               Group  Group  beat  Commit Fetch
     members: ConcurrentHashMap<consumerId, ConsumerMember>
     rebalanceLock: ReentrantLock  (serialises join/leave/rebalance)
     generationId: int  (incremented on every rebalance)
+
+  ClusterMetadata  (ConcurrentHashMap — volatile writes on failover)
+    leaderMap:   PartitionKey → current leaderId
+    followerMap: PartitionKey → current followerIds[]
+
+  ReplicationManager
+        |
+  For each leader partition:
+    PartitionLeaderState
+      leaderEndOffset: volatile long
+      replicas: Map<brokerId, ReplicaState>
+      highWatermark() = min(leaderEndOffset, all fetchOffsets)
+        |
+  For each follower partition:
+    ReplicaFetchThread  (daemon thread per partition)
+      → pulls REPLICA_FETCH from leader every 50ms
+      → appends records to local LogSegment
+      → on 5 consecutive failures: notifies LeaderElector
+        |
+  LeaderElector
+    → promotes self only if first in followerIds list (lowest brokerId wins)
+    → updates ClusterMetadata atomically (single volatile write)
 ```
 
 ### Threading Model
@@ -96,10 +122,23 @@ Request types           Response types
                                                     + [offset(8) + len(4) + payload]*
   0x04  JOIN_GROUP        0x84  JOIN_GROUP_ACK      error(1) + generationId(4) + count(4)
                                                     + [partitionId(4)]*
+                                                    + [partitionId(4)]*
   0x05  LEAVE_GROUP       0x85  LEAVE_GROUP_ACK     error(1)
   0x06  HEARTBEAT         0x86  HEARTBEAT_ACK       error(1)
   0x07  OFFSET_COMMIT     0x87  OFFSET_COMMIT_ACK   error(1)
   0x08  OFFSET_FETCH      0x88  OFFSET_FETCH_ACK    error(1) + offset(8)
+  0x09  REPLICA_FETCH     0x89  REPLICA_FETCH_ACK   error(1) + leaderEndOffset(8) + count(4)
+                                                    + [offset(8) + len(4) + payload]*
+  0x0A  METADATA          0x8A  METADATA_ACK        error(1) + brokerCount(4)
+                                                    + [brokerId(4) + hostLen(2) + host + port(4)]*
+                                                    + assignCount(4)
+                                                    + [topicLen(2) + topic + partitionId(4)
+                                                       + leaderId(4) + followerCount(4)
+                                                       + [followerId(4)]*]*
+
+REPLICA_FETCH payload:   topicLen(2) + topic + partitionId(4) + followerBrokerId(4)
+                         + fetchOffset(8) + maxBytes(4)
+METADATA payload:        (none — type byte only)
 
 CREATE_TOPIC payload:    topicLen(2) + topic + numPartitions(4)
 PRODUCE payload:         topicLen(2) + topic + keyLen(4) + key? + payloadLen(4) + payload
@@ -151,13 +190,24 @@ event-streaming-system/
 │       ├── handler/
 │       │   ├── RequestDispatcher.java
 │       │   ├── CreateTopicHandler.java
-│       │   ├── ProduceHandler.java
-│       │   ├── FetchHandler.java     # Group-aware: validates ownership and generation
+│       │   ├── ProduceHandler.java        # Rejects produce if not leader
+│       │   ├── FetchHandler.java          # HW-clamped reads; rejects if not leader
 │       │   ├── JoinGroupHandler.java
 │       │   ├── LeaveGroupHandler.java
 │       │   ├── HeartbeatHandler.java
 │       │   ├── OffsetCommitHandler.java
-│       │   └── OffsetFetchHandler.java
+│       │   ├── OffsetFetchHandler.java
+│       │   ├── ReplicaFetchHandler.java   # Serves pull-based replication requests
+│       │   └── MetadataHandler.java       # Returns live broker + assignment topology
+│       ├── cluster/
+│       │   ├── PartitionKey.java          # Composite map key (topic + partitionId)
+│       │   ├── ReplicaState.java          # Per-follower fetch offset (volatile)
+│       │   ├── PartitionLeaderState.java  # Leader end-offset + HW computation
+│       │   ├── ClusterMetadata.java       # Live topology; updated on failover
+│       │   ├── ReplicaConnection.java     # Blocking TCP for intra-broker replication
+│       │   ├── ReplicaFetchThread.java    # Background pull loop (one per follower partition)
+│       │   ├── LeaderElector.java         # Promotes self after leader timeout
+│       │   └── ReplicationManager.java    # Lifecycle owner for all replication state
 │       ├── group/
 │       │   ├── GroupState.java       # EMPTY | REBALANCING | STABLE
 │       │   ├── ConsumerMember.java   # Per-consumer liveness and assignment state
@@ -181,10 +231,14 @@ event-streaming-system/
         ├── Consumer.java             # Polling consumer — plain and group-aware
         ├── FetchResult.java          # partitionId + messages + nextOffset
         ├── RebalanceException.java   # Thrown when broker signals rebalance
+        ├── NotLeaderException.java   # Thrown when broker returns NOT_LEADER
+        ├── MetadataClient.java       # Fetches and caches cluster topology
+        ├── ClusterProducer.java      # Metadata-aware producer with leader routing + retry
         └── demo/
             ├── ProducerDemo.java
             ├── ConsumerDemo.java
-            └── ConsumerGroupDemo.java
+            ├── ConsumerGroupDemo.java
+            └── ReplicationDemo.java
 ```
 
 ---
@@ -227,6 +281,18 @@ Rebalance events (join and leave) are infrequent relative to fetch throughput. S
 **Heartbeat reaper via `ScheduledExecutorService`**
 A single daemon thread runs every second (configurable) and evicts members whose `lastHeartbeatMs` exceeds the session timeout. Evictions trigger an automatic rebalance, reassigning orphaned partitions to surviving members.
 
+**Pull-based replication — follower drives fetch rate**
+`ReplicaFetchThread` opens a persistent TCP connection to the leader and loops: send `REPLICA_FETCH`, receive records, append to local log, sleep 50ms if caught up. The pull model provides natural back-pressure: a slow follower never blocks the leader, and the leader's send buffer never overflows.
+
+**High Watermark — consumers see only fully replicated data**
+`PartitionLeaderState` tracks `leaderEndOffset` (updated after each append) and each follower's `fetchOffset` (updated when a `REPLICA_FETCH` arrives). HW = min across all. `FetchHandler` clamps consumer reads to HW so a record is only visible after every replica has it. In single-node mode HW = `Long.MAX_VALUE` — no clamping.
+
+**Deterministic leader election — no coordination service**
+When a follower detects the leader is unreachable (5 consecutive `ReplicaConnection` timeouts), `LeaderElector.reportLeaderFailure()` is called. It promotes this broker only if it is the first entry in the follower list. Follower lists are ordered by brokerId (ascending), so the lowest-numbered live follower always wins — no quorum vote needed, no ZooKeeper. The trade-off: two brokers that both detect failure simultaneously may both attempt promotion, but only one passes the list-position check.
+
+**Volatile `ConcurrentHashMap` for live topology**
+`ClusterMetadata.promoteSelf()` calls `ConcurrentHashMap.put()` — a single volatile write immediately visible to all threads calling `isLeader()` / `leaderId()`. No lock is held during failover. Clients discover the change on their next `MetadataClient.refresh()` (triggered by `NotLeaderException`).
+
 ---
 
 ## Requirements
@@ -262,7 +328,9 @@ java -jar broker/target/broker-1.0.0-SNAPSHOT.jar \
   --queue-cap 10000          \
   --partitions 1             \
   --session-timeout 30000    \
-  --reaper-interval 1000
+  --reaper-interval 1000     \
+  --broker-id 1              \
+  --cluster-config /path/to/cluster.properties
 ```
 
 **Run the producer demo**
@@ -284,6 +352,25 @@ java -cp client/target/client-1.0.0-SNAPSHOT.jar \
 ```bash
 java -cp client/target/client-1.0.0-SNAPSHOT.jar \
      com.eventstream.client.demo.ConsumerGroupDemo
+```
+
+**Run the replication demo (requires two brokers)**
+
+```bash
+# cluster.properties
+# broker.1=localhost:9092
+# broker.2=localhost:9093
+# assign.repl-topic.0=1:2
+# assign.repl-topic.1=2:1
+
+java -jar broker/target/broker-1.0.0-SNAPSHOT.jar \
+  --broker-id 1 --port 9092 --cluster-config cluster.properties
+
+java -jar broker/target/broker-1.0.0-SNAPSHOT.jar \
+  --broker-id 2 --port 9093 --cluster-config cluster.properties
+
+java -cp client/target/client-1.0.0-SNAPSHOT.jar \
+     com.eventstream.client.demo.ReplicationDemo
 ```
 
 ---
@@ -339,11 +426,6 @@ Demo complete.
 
 ## Roadmap
 
-**Phase 4 — Replication**
-- Leader / follower model per partition
-- In-sync replica set (ISR)
-- Basic failover on leader failure
-
 **Phase 5 — Performance**
 - Batch writes and read-ahead
 - Zero-copy path (`FileChannel.transferTo`)
@@ -357,5 +439,5 @@ Demo complete.
 Phase 1 — Complete
 Phase 2 — Complete
 Phase 3 — Complete
-Phase 4 — Planned
+Phase 4 — Complete
 Phase 5 — Planned

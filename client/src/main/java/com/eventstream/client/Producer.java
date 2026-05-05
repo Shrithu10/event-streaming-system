@@ -60,6 +60,11 @@ public final class Producer implements Closeable {
         ByteBuffer resp = conn.receive();
         /* type      = */ resp.get();
         byte error     = resp.get();
+        if (error == ErrorCode.NOT_LEADER) {
+            // Consume the remaining partitionId + offset fields so the connection stays in sync.
+            if (resp.remaining() >= 12) { resp.getInt(); resp.getLong(); }
+            throw new NotLeaderException("Broker is not the leader — refresh metadata and retry");
+        }
         if (error != ErrorCode.NONE) {
             throw new IOException("send failed, error=0x" + Integer.toHexString(error & 0xFF));
         }

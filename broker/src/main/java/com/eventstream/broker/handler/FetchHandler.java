@@ -1,5 +1,6 @@
 package com.eventstream.broker.handler;
 
+import com.eventstream.broker.cluster.ReplicationManager;
 import com.eventstream.broker.group.ConsumerGroup;
 import com.eventstream.broker.group.ConsumerGroup.FetchValidation;
 import com.eventstream.broker.group.ConsumerGroupManager;
@@ -22,10 +23,13 @@ public final class FetchHandler {
 
     private final TopicManager         topicManager;
     private final ConsumerGroupManager groupManager;
+    private final ReplicationManager   replicationManager;
 
-    public FetchHandler(TopicManager topicManager, ConsumerGroupManager groupManager) {
-        this.topicManager = topicManager;
-        this.groupManager = groupManager;
+    public FetchHandler(TopicManager topicManager, ConsumerGroupManager groupManager,
+                        ReplicationManager replicationManager) {
+        this.topicManager       = topicManager;
+        this.groupManager       = groupManager;
+        this.replicationManager = replicationManager;
     }
 
     /**
@@ -89,6 +93,12 @@ public final class FetchHandler {
             }
         }
 
+        // ---- Phase 4: leader check ----
+        // Clients must read from the leader.  In single-node mode isLeader() is always true.
+        if (!replicationManager.isLeader(topic, partitionId)) {
+            return ResponseEncoder.fetchResponse(ErrorCode.NOT_LEADER, Collections.emptyList());
+        }
+
         // ---- Storage read (identical for both paths) ----
         Partition partition = topicManager.getPartition(topic, partitionId);
         if (partition == null) {
@@ -96,7 +106,21 @@ public final class FetchHandler {
         }
 
         try {
-            List<LogEntry> entries = partition.fetch(startOffset, maxBytes);
+            // Clamp reads to the High Watermark so consumers never see un-replicated data.
+            // In single-node mode HW = Long.MAX_VALUE, so no clamping occurs.
+            long hw             = replicationManager.highWatermark(topic, partitionId);
+            long clampedOffset  = Math.min(startOffset, hw);
+            int  clampedMaxBytes = maxBytes;
+
+            // Reduce maxBytes so we don't read records that start at or after HW.
+            // The simplest safe bound: read up to hw bytes from startOffset.
+            if (hw < Long.MAX_VALUE && hw > clampedOffset) {
+                clampedMaxBytes = (int) Math.min(maxBytes, hw - clampedOffset);
+            } else if (hw != Long.MAX_VALUE && hw <= clampedOffset) {
+                return ResponseEncoder.fetchResponse(ErrorCode.NONE, Collections.emptyList());
+            }
+
+            List<LogEntry> entries = partition.fetch(clampedOffset, clampedMaxBytes);
             return ResponseEncoder.fetchResponse(ErrorCode.NONE, entries);
         } catch (IOException e) {
             log.severe("Fetch failed topic=" + topic + " partition=" + partitionId + ": " + e.getMessage());

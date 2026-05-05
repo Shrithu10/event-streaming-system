@@ -1,5 +1,6 @@
 package com.eventstream.broker.handler;
 
+import com.eventstream.broker.cluster.ReplicationManager;
 import com.eventstream.broker.group.ConsumerGroupManager;
 import com.eventstream.broker.network.ResponseEncoder;
 import com.eventstream.broker.topic.TopicManager;
@@ -25,16 +26,21 @@ public final class RequestDispatcher {
     private final HeartbeatHandler    heartbeatHandler;
     private final OffsetCommitHandler offsetCommitHandler;
     private final OffsetFetchHandler  offsetFetchHandler;
+    private final ReplicaFetchHandler replicaFetchHandler;
+    private final MetadataHandler     metadataHandler;
 
-    public RequestDispatcher(TopicManager topicManager, ConsumerGroupManager groupManager) {
+    public RequestDispatcher(TopicManager topicManager, ConsumerGroupManager groupManager,
+                             ReplicationManager replicationManager) {
         this.createTopicHandler  = new CreateTopicHandler(topicManager);
-        this.produceHandler      = new ProduceHandler(topicManager);
-        this.fetchHandler        = new FetchHandler(topicManager, groupManager);
+        this.produceHandler      = new ProduceHandler(topicManager, replicationManager);
+        this.fetchHandler        = new FetchHandler(topicManager, groupManager, replicationManager);
         this.joinGroupHandler    = new JoinGroupHandler(groupManager);
         this.leaveGroupHandler   = new LeaveGroupHandler(groupManager);
         this.heartbeatHandler    = new HeartbeatHandler(groupManager);
         this.offsetCommitHandler = new OffsetCommitHandler(groupManager);
         this.offsetFetchHandler  = new OffsetFetchHandler(groupManager);
+        this.replicaFetchHandler = new ReplicaFetchHandler(topicManager, replicationManager);
+        this.metadataHandler     = new MetadataHandler(replicationManager);
     }
 
     public ByteBuffer dispatch(ByteBuffer frame) {
@@ -51,6 +57,8 @@ public final class RequestDispatcher {
             case RequestType.HEARTBEAT     -> heartbeatHandler.handle(frame);
             case RequestType.OFFSET_COMMIT -> offsetCommitHandler.handle(frame);
             case RequestType.OFFSET_FETCH  -> offsetFetchHandler.handle(frame);
+            case RequestType.REPLICA_FETCH -> replicaFetchHandler.handle(frame);
+            case RequestType.METADATA      -> metadataHandler.handle(frame);
             default -> {
                 log.warning("Unknown request type: 0x" + Integer.toHexString(type & 0xFF));
                 yield ResponseEncoder.errorResponse(ErrorCode.INTERNAL_ERROR);

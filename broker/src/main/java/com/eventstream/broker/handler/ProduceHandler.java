@@ -1,5 +1,6 @@
 package com.eventstream.broker.handler;
 
+import com.eventstream.broker.cluster.ReplicationManager;
 import com.eventstream.broker.network.ResponseEncoder;
 import com.eventstream.broker.topic.Partition;
 import com.eventstream.broker.topic.TopicManager;
@@ -14,10 +15,12 @@ public final class ProduceHandler {
 
     private static final Logger log = Logger.getLogger(ProduceHandler.class.getName());
 
-    private final TopicManager topicManager;
+    private final TopicManager       topicManager;
+    private final ReplicationManager replicationManager;
 
-    public ProduceHandler(TopicManager topicManager) {
-        this.topicManager = topicManager;
+    public ProduceHandler(TopicManager topicManager, ReplicationManager replicationManager) {
+        this.topicManager       = topicManager;
+        this.replicationManager = replicationManager;
     }
 
     /**
@@ -68,8 +71,17 @@ public final class ProduceHandler {
             return ResponseEncoder.produceAck(ErrorCode.TOPIC_NOT_FOUND, -1, -1);
         }
 
+        // Phase 4: reject produce if this broker is not the leader for the partition.
+        if (!replicationManager.isLeader(topicName, partition.partitionId)) {
+            log.fine("NOT_LEADER for " + topicName + "/" + partition.partitionId);
+            return ResponseEncoder.produceAck(ErrorCode.NOT_LEADER, partition.partitionId, -1);
+        }
+
         try {
             long offset = partition.append(payload);
+            // Advance the leader end-offset so followers can compute HW correctly.
+            replicationManager.updateLeaderEndOffset(
+                    topicName, partition.partitionId, partition.writePosition());
             return ResponseEncoder.produceAck(ErrorCode.NONE, partition.partitionId, offset);
         } catch (IOException e) {
             log.severe("Append failed for topic=" + topicName + ": " + e.getMessage());

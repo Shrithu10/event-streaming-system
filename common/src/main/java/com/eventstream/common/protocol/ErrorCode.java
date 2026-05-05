@@ -16,5 +16,9 @@ public final class ErrorCode {
     public static final byte WRONG_GENERATION       = 0x08;
     public static final byte NOT_ASSIGNED           = 0x09;
 
+    // ---- Phase 4 ----
+    public static final byte NOT_LEADER             = 0x0A;
+    public static final byte BROKER_NOT_AVAILABLE   = 0x0B;
+
     private ErrorCode() {}
 }
