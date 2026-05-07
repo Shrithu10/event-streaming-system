@@ -14,8 +14,13 @@ import java.util.Map;
  *   Consumers see records only up to HW, guaranteeing that any record visible
  *   to a consumer has been durably written on at least one replica.
  *
- * Phase 5+ improvement: maintain an ISR (in-sync replica) set and compute
- *   HW only over ISR members, so a slow/lagging follower does not drag HW down.
+ * Known limitation — no ISR (In-Sync Replica) set:
+ *   HW = min(all replicas), so a single slow or lagging follower drags HW down
+ *   for all consumers on this partition.  In production, Kafka maintains an ISR:
+ *   replicas that have fallen more than replica.lag.time.max.ms behind are
+ *   removed from the set, and HW is computed only over ISR members.  This allows
+ *   the cluster to maintain full consumer throughput even with a degraded replica.
+ *   ISR management is the next step after Phase 4.
  */
 public final class PartitionLeaderState {
 

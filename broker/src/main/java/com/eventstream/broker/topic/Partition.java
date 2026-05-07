@@ -6,6 +6,7 @@ import com.eventstream.broker.storage.LogSegment;
 import java.io.Closeable;
 import java.io.IOException;
 import java.util.List;
+import java.util.ArrayList;
 
 /**
  * Represents a single partition of a topic.
@@ -28,6 +29,16 @@ public final class Partition implements Closeable {
 
     public long append(byte[] message) throws IOException {
         return segment.append(message);
+    }
+
+    /**
+     * Appends multiple records in one write-lock acquisition.
+     * Used by ReplicaFetchThread to commit an entire REPLICA_FETCH batch atomically.
+     *
+     * @return byte offset of the first record written
+     */
+    public long appendBatch(List<byte[]> payloads) throws IOException {
+        return segment.appendBatch(payloads);
     }
 
     public List<LogEntry> fetch(long startOffset, int maxBytes) throws IOException {

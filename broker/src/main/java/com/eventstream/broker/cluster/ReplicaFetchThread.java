@@ -18,46 +18,74 @@ import java.util.logging.Logger;
  * Background thread that continuously pulls new records from the leader for
  * one partition and appends them to the local (follower) log.
  *
- * Pull-based design (same as Kafka):
- *   The follower drives the fetch rate, which naturally provides back-pressure:
- *   a slow follower never blocks the leader.  The leader's ReplicaFetchHandler
- *   uses the fetchOffset in each request to track how far each follower has
- *   caught up, which it uses to advance the High Watermark.
+ * ---- Pull-based design ----
+ * The follower drives the fetch rate, providing natural back-pressure: a slow
+ * follower never blocks the leader.  The leader's ReplicaFetchHandler records
+ * the fetchOffset from each request to advance the High Watermark.
  *
- * Failure detection and leader election:
- *   After FAILURE_THRESHOLD consecutive I/O failures (each separated by
- *   FAILURE_BACKOFF_MS), the thread notifies LeaderElector.  The elector
- *   promotes this broker only if it is first in the follower list
- *   (deterministic tie-break, preventing split-brain in a 2-broker cluster).
+ * ---- Batch append ----
+ * Each REPLICA_FETCH response can contain up to MAX_BYTES of records.
+ * All records in the response are committed to the local log via a single
+ * Partition.appendBatch() call, which holds the write lock once for the
+ * entire batch rather than once per record.  This reduces lock contention
+ * and syscall count during catch-up by an order of magnitude compared to
+ * one append() per record.
+ *
+ * ---- Adaptive polling ----
+ * When the follower is caught up (leader returns empty):
+ *   - Sleep starts at MIN_POLL_MS (5ms) and doubles each empty response up
+ *     to MAX_POLL_MS (200ms).
+ *   - When new data arrives, sleep resets immediately to MIN_POLL_MS.
+ * This keeps latency low during active replication (sub-10ms pick-up after
+ * a new produce) while avoiding a busy-spin when the log tail is quiet.
+ *
+ * ---- Failure detection ----
+ * After FAILURE_THRESHOLD consecutive I/O failures the thread calls
+ * LeaderElector.reportLeaderFailure().  The elector promotes this broker
+ * only if it is first in the follower list (lowest brokerId wins).
+ *
+ * ---- Known limitation: split-brain risk ----
+ * In a network partition where both brokers can still serve clients but
+ * cannot reach each other, both may independently satisfy the promotion
+ * condition if they have equal brokerId ordering.  The deterministic
+ * tie-break prevents this in the common case (two-broker cluster, no
+ * simultaneous partition and crash), but cannot prevent it under all
+ * failure modes.  A production system requires a consensus protocol
+ * (Raft, ZooKeeper) for safe leader election.
  *
  * REPLICA_FETCH request wire format (after the 4-byte length prefix):
  *   [1B  type = 0x09]
  *   [2B  topicLen][N  topic]
  *   [4B  partitionId]
- *   [4B  followerBrokerId]     — lets the leader update ReplicaState
- *   [8B  fetchOffset]          — next byte offset the follower needs
+ *   [4B  followerBrokerId]  — lets the leader update the correct ReplicaState
+ *   [8B  fetchOffset]       — next byte offset the follower needs
  *   [4B  maxBytes]
  */
 public final class ReplicaFetchThread implements Runnable {
 
     private static final Logger log = Logger.getLogger(ReplicaFetchThread.class.getName());
 
-    private static final int FETCH_INTERVAL_MS  = 50;    // sleep when log tail is caught up
     private static final int MAX_BYTES          = 1 << 20; // 1 MiB per fetch
-    private static final int FAILURE_THRESHOLD  = 5;     // consecutive failures → election
+    private static final int FAILURE_THRESHOLD  = 5;       // consecutive failures → election
     private static final int FAILURE_BACKOFF_MS = 1_000;
 
-    private final int                    localBrokerId;
-    private final String                 topic;
-    private final int                    partitionId;
+    // Adaptive polling: sleep grows from MIN → MAX when log tail is caught up;
+    // resets to MIN immediately when new records arrive.
+    private static final int MIN_POLL_MS = 5;
+    private static final int MAX_POLL_MS = 200;
+
+    private final int                      localBrokerId;
+    private final String                   topic;
+    private final int                      partitionId;
     private final ClusterConfig.BrokerInfo leaderInfo;
-    private final Partition              localPartition;
-    private final LeaderElector          elector;
+    private final Partition                localPartition;
+    private final LeaderElector            elector;
 
     private volatile boolean running = true;
-    private long             fetchOffset;       // next byte offset to request
+    private long             fetchOffset;          // next byte offset to request from leader
     private ReplicaConnection conn;
     private int              consecutiveFailures = 0;
+    private int              pollSleepMs         = MIN_POLL_MS;
 
     public ReplicaFetchThread(int localBrokerId, String topic, int partitionId,
                                ClusterConfig.BrokerInfo leaderInfo,
@@ -69,7 +97,7 @@ public final class ReplicaFetchThread implements Runnable {
         this.localPartition = localPartition;
         this.elector        = elector;
         // Start from the end of the local log to avoid re-fetching records
-        // already present from a previous run.
+        // already present from a previous run of this broker.
         this.fetchOffset    = localPartition.writePosition();
     }
 
@@ -85,17 +113,25 @@ public final class ReplicaFetchThread implements Runnable {
 
                 if (records.isEmpty()) {
                     consecutiveFailures = 0;
-                    Thread.sleep(FETCH_INTERVAL_MS);
+                    // Adaptive back-off when caught up.
+                    Thread.sleep(pollSleepMs);
+                    pollSleepMs = Math.min(pollSleepMs * 2, MAX_POLL_MS);
                     continue;
                 }
 
-                for (LogEntry entry : records) {
-                    localPartition.append(entry.payload);
-                }
+                // Batch-append all records under a single write lock.
+                // This is the critical path improvement over one append() per record:
+                // one lock acquisition + one contiguous write per REPLICA_FETCH response.
+                List<byte[]> payloads = new ArrayList<>(records.size());
+                for (LogEntry entry : records) payloads.add(entry.payload);
+                localPartition.appendBatch(payloads);
 
-                // Advance cursor to the byte position after the last record.
+                // Advance cursor past the last record in this batch.
                 LogEntry last = records.get(records.size() - 1);
                 fetchOffset = last.offset + 4 + last.payload.length;
+
+                // Data is flowing — reset poll interval for aggressive catching up.
+                pollSleepMs         = MIN_POLL_MS;
                 consecutiveFailures = 0;
 
             } catch (InterruptedException e) {
@@ -109,7 +145,7 @@ public final class ReplicaFetchThread implements Runnable {
 
                 if (consecutiveFailures >= FAILURE_THRESHOLD) {
                     elector.reportLeaderFailure(topic, partitionId, leaderInfo.brokerId());
-                    break; // ReplicationManager.onLeaderPromotion() will restart as leader
+                    break; // ReplicationManager.onLeaderPromotion() restarts this partition as leader
                 }
 
                 try {
@@ -149,7 +185,7 @@ public final class ReplicaFetchThread implements Runnable {
             return Collections.emptyList(); // e.g. TOPIC_NOT_FOUND before topic is created
         }
 
-        /* leaderEndOffset = */ resp.getLong(); // informational; not used for HW here
+        /* leaderEndOffset = */ resp.getLong(); // reserved; not used for HW here
         int count = resp.getInt();
         if (count == 0) return Collections.emptyList();
 

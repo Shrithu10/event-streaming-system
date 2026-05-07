@@ -142,6 +142,46 @@ public final class LogSegment implements Closeable {
         return entries;
     }
 
+    /**
+     * Appends a batch of records under a single write-lock acquisition.
+     *
+     * All records in the batch are serialised into one contiguous ByteBuffer
+     * and written with a single positional FileChannel.write() call (modulo
+     * short-write retries).  This reduces lock overhead and syscall count
+     * proportionally to the batch size.
+     *
+     * Used by ReplicaFetchThread so an entire REPLICA_FETCH response (up to
+     * 1 MiB of records) is committed atomically rather than one record at a time.
+     *
+     * @return byte offset of the first record in the batch
+     */
+    public long appendBatch(List<byte[]> payloads) throws IOException {
+        if (payloads.isEmpty()) throw new IllegalArgumentException("appendBatch requires at least one record");
+
+        int totalSize = 0;
+        for (byte[] p : payloads) totalSize += 4 + p.length;
+
+        ByteBuffer buf = ByteBuffer.allocate(totalSize);
+        for (byte[] p : payloads) {
+            buf.putInt(p.length);
+            buf.put(p);
+        }
+        buf.flip();
+
+        writeLock.lock();
+        try {
+            long firstOffset = writePosition.get();
+            long pos         = firstOffset;
+            while (buf.hasRemaining()) {
+                pos += channel.write(buf, pos);
+            }
+            writePosition.addAndGet(totalSize);
+            return firstOffset;
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
     /** Current committed write position (i.e. the offset of the next record). */
     public long size() {
         return writePosition.get();

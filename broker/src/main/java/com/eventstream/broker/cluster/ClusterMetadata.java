@@ -16,6 +16,15 @@ import java.util.concurrent.ConcurrentHashMap;
  *   - isLeader() always returns true.
  *   - isFollower() always returns false.
  *   - Replication is disabled.
+ *
+ * Known limitation — metadata propagation delay:
+ *   promoteSelf() updates in-process memory only.  Other broker instances
+ *   do not see the new leader until their clients refresh metadata (triggered
+ *   by a NotLeaderException on the next produce/fetch attempt).  There is no
+ *   broadcast or gossip protocol: convergence is eventual and driven entirely
+ *   by client retries.  This is acceptable for Phase 4's static-cluster model
+ *   but would require a distributed metadata store (etcd, ZooKeeper) in a
+ *   production system where brokers must have a consistent view of leadership.
  */
 public final class ClusterMetadata {
 
