@@ -88,8 +88,8 @@ Topic               Group  Group  beat  Commit Fetch
         |
   For each follower partition:
     ReplicaFetchThread  (daemon thread per partition)
-      → pulls REPLICA_FETCH from leader every 50ms
-      → appends records to local LogSegment
+      → pulls REPLICA_FETCH from leader (adaptive poll: 5ms → 200ms back-off when idle)
+      → batch-appends records to local LogSegment under a single write lock
       → on 5 consecutive failures: notifies LeaderElector
         |
   LeaderElector
@@ -182,7 +182,8 @@ event-streaming-system/
 ├── common/
 │   └── protocol/
 │       ├── RequestType.java          # Request / response type bytes
-│       └── ErrorCode.java            # Error code constants
+│       ├── ErrorCode.java            # Error code constants
+│       └── ClusterConfig.java        # Static cluster topology (brokers + partition assignments)
 │
 ├── broker/
 │   └── broker/
@@ -237,20 +238,20 @@ event-streaming-system/
 │           └── Murmur2.java          # 32-bit hash for partition routing
 │
 ├── client/
-    └── client/
-        ├── BrokerConnection.java     # Blocking socket, length-prefix framing
-        ├── Producer.java             # Synchronous producer (key-routed or round-robin)
-        ├── Consumer.java             # Polling consumer — plain and group-aware
-        ├── FetchResult.java          # partitionId + messages + nextOffset
-        ├── RebalanceException.java   # Thrown when broker signals rebalance
-        ├── NotLeaderException.java   # Thrown when broker returns NOT_LEADER
-        ├── MetadataClient.java       # Fetches and caches cluster topology
-        ├── ClusterProducer.java      # Metadata-aware producer with leader routing + retry
-        └── demo/
-            ├── ProducerDemo.java
-            ├── ConsumerDemo.java
-            ├── ConsumerGroupDemo.java
-            └── ReplicationDemo.java
+│   └── client/
+│       ├── BrokerConnection.java     # Blocking socket, length-prefix framing
+│       ├── Producer.java             # Synchronous producer (key-routed or round-robin)
+│       ├── Consumer.java             # Polling consumer — plain and group-aware
+│       ├── FetchResult.java          # partitionId + messages + nextOffset
+│       ├── RebalanceException.java   # Thrown when broker signals rebalance
+│       ├── NotLeaderException.java   # Thrown when broker returns NOT_LEADER
+│       ├── MetadataClient.java       # Fetches and caches cluster topology (30s TTL)
+│       ├── ClusterProducer.java      # Metadata-aware producer with leader routing + retry
+│       └── demo/
+│           ├── ProducerDemo.java
+│           ├── ConsumerDemo.java
+│           ├── ConsumerGroupDemo.java
+│           └── ReplicationDemo.java
 │
 └── benchmark/
     └── benchmark/
@@ -281,7 +282,7 @@ Partitions are fixed at topic creation time. An array indexed by partition id is
 Java's `String.hashCode()` has poor low-bit distribution, which causes hot partitions with certain key patterns. Murmur2 (the same algorithm Kafka uses) produces a uniform 32-bit output, yielding balanced partition load regardless of key structure.
 
 **Offset = byte position**
-`FileChannel.read(buffer, offset)` seeks to any position in O(1) — no index file is needed. Phase 4 may introduce a sparse `.index` file mapping logical message numbers to byte positions.
+`FileChannel.read(buffer, offset)` seeks to any position in O(1) — no index file is needed. A sparse `.index` file mapping logical message numbers to byte positions would be the natural next step for range scans, but is not required for the current single-segment model.
 
 **Concurrent reads, serialized writes**
 `FileChannel.read(buf, position)` is thread-safe per the Java NIO specification — multiple consumers read concurrently with no locks. All appends hold `ReentrantLock writeLock` and advance `AtomicLong writePosition` only after the write loop completes, so readers never observe a partial record.
@@ -302,7 +303,7 @@ Rebalance events (join and leave) are infrequent relative to fetch throughput. S
 A single daemon thread runs every second (configurable) and evicts members whose `lastHeartbeatMs` exceeds the session timeout. Evictions trigger an automatic rebalance, reassigning orphaned partitions to surviving members.
 
 **Pull-based replication — follower drives fetch rate**
-`ReplicaFetchThread` opens a persistent TCP connection to the leader and loops: send `REPLICA_FETCH`, receive records, append to local log, sleep 50ms if caught up. The pull model provides natural back-pressure: a slow follower never blocks the leader, and the leader's send buffer never overflows.
+`ReplicaFetchThread` opens a persistent TCP connection to the leader and loops: send `REPLICA_FETCH`, receive records, batch-append to local log under a single write lock, then sleep adaptively (5ms on active data, doubling up to 200ms when the log tail is idle, resetting immediately when new data arrives). The pull model provides natural back-pressure: a slow follower never blocks the leader.
 
 **High Watermark — consumers see only fully replicated data**
 `PartitionLeaderState` tracks `leaderEndOffset` (updated after each append) and each follower's `fetchOffset` (updated when a `REPLICA_FETCH` arrives). HW = min across all. `FetchHandler` clamps consumer reads to HW so a record is only visible after every replica has it. In single-node mode HW = `Long.MAX_VALUE` — no clamping.
