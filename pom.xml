@@ -14,6 +14,7 @@
     <module>common</module>
     <module>broker</module>
     <module>client</module>
+    <module>benchmark</module>
   </modules>
 
   <properties>

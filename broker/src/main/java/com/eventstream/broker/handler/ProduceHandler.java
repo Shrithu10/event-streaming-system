@@ -1,6 +1,7 @@
 package com.eventstream.broker.handler;
 
 import com.eventstream.broker.cluster.ReplicationManager;
+import com.eventstream.broker.metrics.BrokerMetrics;
 import com.eventstream.broker.network.ResponseEncoder;
 import com.eventstream.broker.topic.Partition;
 import com.eventstream.broker.topic.TopicManager;
@@ -78,7 +79,9 @@ public final class ProduceHandler {
         }
 
         try {
+            long t0     = System.nanoTime();
             long offset = partition.append(payload);
+            BrokerMetrics.get().recordAppend(payload.length, System.nanoTime() - t0);
             // Advance the leader end-offset so followers can compute HW correctly.
             replicationManager.updateLeaderEndOffset(
                     topicName, partition.partitionId, partition.writePosition());

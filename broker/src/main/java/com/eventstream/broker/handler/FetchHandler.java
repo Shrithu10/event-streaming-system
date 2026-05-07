@@ -4,6 +4,7 @@ import com.eventstream.broker.cluster.ReplicationManager;
 import com.eventstream.broker.group.ConsumerGroup;
 import com.eventstream.broker.group.ConsumerGroup.FetchValidation;
 import com.eventstream.broker.group.ConsumerGroupManager;
+import com.eventstream.broker.metrics.BrokerMetrics;
 import com.eventstream.broker.network.ResponseEncoder;
 import com.eventstream.broker.storage.LogEntry;
 import com.eventstream.broker.topic.Partition;
@@ -120,7 +121,10 @@ public final class FetchHandler {
                 return ResponseEncoder.fetchResponse(ErrorCode.NONE, Collections.emptyList());
             }
 
+            long           t0      = System.nanoTime();
             List<LogEntry> entries = partition.fetch(clampedOffset, clampedMaxBytes);
+            int fetchedBytes = entries.stream().mapToInt(e -> 4 + e.payload.length).sum();
+            BrokerMetrics.get().recordFetch(fetchedBytes, System.nanoTime() - t0);
             return ResponseEncoder.fetchResponse(ErrorCode.NONE, entries);
         } catch (IOException e) {
             log.severe("Fetch failed topic=" + topic + " partition=" + partitionId + ": " + e.getMessage());

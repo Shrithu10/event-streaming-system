@@ -3,6 +3,8 @@ package com.eventstream.broker;
 import com.eventstream.broker.cluster.ClusterMetadata;
 import com.eventstream.broker.cluster.ReplicationManager;
 import com.eventstream.broker.group.ConsumerGroupManager;
+import com.eventstream.broker.metrics.BrokerMetrics;
+import com.eventstream.broker.metrics.MetricsReporter;
 import com.eventstream.broker.topic.TopicManager;
 import com.eventstream.common.protocol.ClusterConfig;
 
@@ -35,11 +37,15 @@ public final class BrokerMain {
         ReplicationManager   replicationManager  = new ReplicationManager(clusterMetadata, topicManager);
         replicationManager.start();
 
+        MetricsReporter metricsReporter = new MetricsReporter(BrokerMetrics.get());
+        metricsReporter.start();
+
         BrokerServer server = new BrokerServer(config, topicManager, groupManager, replicationManager);
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             log.info("Shutdown requested");
             server.stop();
+            metricsReporter.stop();
             replicationManager.close();
             groupManager.close();
             topicManager.close();

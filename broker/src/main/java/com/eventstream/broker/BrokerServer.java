@@ -15,6 +15,7 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Set;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
 
@@ -66,6 +67,10 @@ public final class BrokerServer {
 
     // Workers → Selector (interest-op mutations)
     private final ConcurrentLinkedQueue<PendingChange> pendingChanges = new ConcurrentLinkedQueue<>();
+
+    // Wakeup batching: shared with all workers; one selector.wakeup() per response burst.
+    // See RequestWorker Javadoc for the full protocol.
+    private final AtomicBoolean wakeupScheduled = new AtomicBoolean(false);
 
     // Connections paused due to back-pressure (OP_READ suspended).
     // Accessed only by the selector thread.
@@ -122,7 +127,8 @@ public final class BrokerServer {
         };
         workerPool = Executors.newFixedThreadPool(config.workerThreads, tf);
         for (int i = 0; i < config.workerThreads; i++) {
-            workerPool.submit(new RequestWorker(requestQueue, pendingChanges, selector, dispatcher));
+            workerPool.submit(new RequestWorker(
+                    requestQueue, pendingChanges, selector, dispatcher, wakeupScheduled));
         }
         log.info("Started " + config.workerThreads + " worker threads");
     }
@@ -145,6 +151,10 @@ public final class BrokerServer {
     private void eventLoop() {
         while (running) {
             try {
+                // Reset the wakeup gate BEFORE draining pendingChanges so that any
+                // worker enqueuing between the drain and select() will win the CAS
+                // and call wakeup(), preventing select() from blocking with pending work.
+                wakeupScheduled.set(false);
                 applyPendingChanges();   // must precede select() — applies OP_WRITE registrations
                 resumePausedConnections();
 
